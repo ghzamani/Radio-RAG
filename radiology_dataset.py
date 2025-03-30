@@ -1,7 +1,5 @@
 from torch.utils.data import Dataset
-# import torch
-# import numpy as np
-# from torchvision.transforms import ToTensor
+
 
 class RadiologyDataset(Dataset):
     def __init__(self, hf_dataset):

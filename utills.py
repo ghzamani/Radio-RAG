@@ -1,4 +1,3 @@
-import os
 from transformers import BertTokenizer, ViTImageProcessor, VisionEncoderDecoderModel
 
 
@@ -21,8 +20,8 @@ def load_chexpert_model(model_name_or_path="IAMJB/chexpert-mimic-cxr-impression-
     }
     return model, tokenizer, image_processor, generation_args
 
-# def chexpert_jpg_to_png(filename, directory="/content/radiobench/PNG"):
-#     # in csv, images have jpg format but the real images are png!
-#     if filename.endswith(".jpg"):
-#         filename = filename.replace( ".jpg", ".png")
-#     return os.path.join(directory, filename)
+
+def save_list_to_text(my_list, file_path):
+    with open(file_path, "w") as f:
+        for item in my_list:
+            f.write(f"{item}\n")
