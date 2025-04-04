@@ -3,22 +3,13 @@ import os
 # os.environ['HF_HOME'] = "/mnt/disk2/ghazal.zamaninezhad/hf_cache"
 os.environ['HF_HOME'] = "/home/m_nobakhtian/mmed/hf_cache"
 
-from transformers import AutoModelForCausalLM, AutoProcessor
-import torch
-from datasets import load_dataset
 from collections import defaultdict
-import pandas as pd
+import torch
+from tqdm import tqdm
 
+from inference import maira_predict
+from utills import load_radio_bench, load_maira_model, save_list_to_txt
 
-def get_radio_bench():
-    print("Loading chexpert dataset...")
-    # radiology_bench = load_dataset("ghazal-zamani/radiology_benchmark")['validation']
-    radiology_bench = load_dataset("ghazal-zamani/radio_benchmark")['validation']
-    # ch_plus = radiology_bench.filter(lambda x: x['dataset_name'] == 'chexpert_plus')
-    ch_plus = radiology_bench
-    print(f"Number of validation samples: {len(ch_plus)}")
-    # return ch_plus[0]
-    return ch_plus
 
 def separate_chexpert(ch_plus):
     """
@@ -89,47 +80,6 @@ def group_multi_study_patient(multi_study_patients):
     return frontal_lateral
 
 
-def load_maira_model(path, eval_mode=True):
-    model = AutoModelForCausalLM.from_pretrained(path,
-                                                 torch_dtype=torch.float16,
-                                                 trust_remote_code=True)
-    processor = AutoProcessor.from_pretrained(path, trust_remote_code=True)
-
-    if eval_mode:
-        model = model.eval()
-
-    print("model loaded")
-    return model, processor
-
-
-def predict(model, processor, sample_data, device="cuda"):
-    processed_inputs = processor.format_and_preprocess_reporting_input(
-        current_frontal=sample_data["current_frontal"],
-        current_lateral=sample_data["current_lateral"],
-        prior_frontal=sample_data["prior_frontal"],
-        indication=None,
-        technique=None,
-        comparison=None,
-        prior_report=None,  # Our example has no prior
-        return_tensors="pt",
-        get_grounding=False,  # For this example we generate a non-grounded report
-    )
-
-    processed_inputs = processed_inputs.to(device)
-    with torch.no_grad():
-        output_decoding = model.generate(
-            **processed_inputs,
-            max_new_tokens=300,  # Set to 450 for grounded reporting
-            use_cache=True,
-        )
-    prompt_length = processed_inputs["input_ids"].shape[-1]
-    decoded_text = processor.decode(output_decoding[0][prompt_length:], skip_special_tokens=True)
-    decoded_text = decoded_text.lstrip()  # Findings generation completions have a single leading space
-    prediction = processor.convert_output_to_plaintext_or_grounded_sequence(decoded_text)
-    # print("Parsed prediction:", prediction)
-    return prediction
-
-
 def main():
     # load model
     # path = "/mnt/disk2/ghazal.zamaninezhad/base_models/maira-2"
@@ -137,13 +87,11 @@ def main():
     model, processor = load_maira_model(path)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
-    ch_plus = get_radio_bench()
+    ch_plus = load_radio_bench()
     multi_study_patients, single_study_patients = separate_chexpert(ch_plus)
     # get list of frontal and lateral indices for multi study patients
     multi_study_grouped = group_multi_study_patient(multi_study_patients)
 
-    reference_findings = []
-    predicted_findings = []
     # create a list of sample dictionaries
     samples = []
     # Process multi-study cases
@@ -151,7 +99,10 @@ def main():
         samples.append({
             "current_frontal": curr_frontal['image'],
             "current_lateral": curr_lateral['image'],
-            "prior_frontal": prev_frontal['image'] if prev_frontal else None,
+            # when adding 3 images for one sample, got the error:
+            # Token indices sequence length is longer than the specified maximum sequence length
+            # "prior_frontal": prev_frontal['image'] if prev_frontal else None,
+            "prior_frontal": None,
             "original_findings": curr_frontal['findings']
         })
         # break
@@ -170,13 +121,21 @@ def main():
         })
         # break
 
-    for sample in samples:
-        prediction = predict(model, processor, sample)
+    reference_findings = []
+    predicted_findings = []
+    for sample in tqdm(samples):
+        prediction = maira_predict(model, processor, sample)
         predicted_findings.append(prediction)
         reference_findings.append(sample["original_findings"])
 
-    print(reference_findings)
-    print(predicted_findings)
+    assert len(predicted_findings) == len(samples)
+
+    output_path = "/home/m_nobakhtian/mmed/Radio-RAG/outputs"
+    # name format: {dataset}_{impression/findings}_model_{ref/pred}
+    save_list_to_txt(predicted_findings, os.path.join(output_path,
+                                                      'chplus_findings_maira_pred.txt'))
+    save_list_to_txt(reference_findings, os.path.join(output_path,
+                                                      'chplus_findings_maira_ref.txt'))
 
 if __name__ == "__main__":
     main()
