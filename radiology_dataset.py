@@ -11,12 +11,14 @@ class RadiologyDataset(Dataset):
     def __getitem__(self, idx):
         example = self.hf_dataset[idx]
 
+        real_id = example['real_id']
+
         # Keep the image in PIL format
         image = example["image"].convert("RGB")  # Do NOT manually convert to tensor!
 
         findings = example["findings"] if example["findings"] else ""
         impression = example["impression"] if example["impression"] else ""
-        return image, findings, impression
+        return real_id, image, findings, impression
 
 
 class RadiologyCollator:
@@ -24,6 +26,6 @@ class RadiologyCollator:
         self.image_processor = processor
 
     def __call__(self, batch):
-        images, findings, impressions = zip(*batch)
+        real_id, images, findings, impressions = zip(*batch)
         pixel_values = self.image_processor(images, return_tensors="pt").pixel_values
-        return pixel_values, findings, impressions
+        return real_id, pixel_values, findings, impressions

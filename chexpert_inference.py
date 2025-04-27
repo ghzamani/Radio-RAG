@@ -30,10 +30,15 @@ def main():
     # print(hyps)
     output_path = "/home/m_nobakhtian/mmed/Radio-RAG/outputs"
     # name format: {dataset}_{impression/findings}_model_{ref/pred}
-    save_list_to_txt(hyps, os.path.join(output_path,
-                                         'chplus_findings_chexpert-mimic-cxr-impression_pred.txt'))
-    save_list_to_txt(refs_findings, os.path.join(output_path,
-                                        'chplus_findings_chexpert-mimic-cxr-impression_ref.txt'))
+    # save_list_to_txt(hyps, os.path.join(output_path,
+    #                                      'chplus_findings_chexpert-mimic-cxr-impression_pred.txt'))
+    # save_list_to_txt(refs_findings, os.path.join(output_path,
+    #                                     'chplus_findings_chexpert-mimic-cxr-impression_ref.txt'))
+    # saving results to file
+    save_list_to_jsonl(hyps, os.path.join(output_path,
+                                         'chplus_findings_chexpert-mimic-cxr-impression_pred.jsonl'))
+    save_list_to_jsonl(refs_findings, os.path.join(output_path,
+                                        'chplus_findings_chexpert-mimic-cxr-impression_ref.jsonl'))
 
 if __name__ == "__main__":
     main()

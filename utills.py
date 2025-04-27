@@ -1,3 +1,4 @@
+import json
 from datasets import load_dataset
 from transformers import (AutoModelForCausalLM, AutoProcessor,
                           BertTokenizer, ViTImageProcessor,
@@ -52,3 +53,21 @@ def save_list_to_txt(my_list, file_path):
     with open(file_path, "w") as f:
         for item in my_list:
             f.write(f"{item}\n")
+
+
+def save_list_to_jsonl(my_list, file_path):
+    with open(file_path, 'w') as f:
+        for item in my_list:
+            # assume my_list is a list of dictionaries
+            if not item.values():
+                continue
+            f.write(json.dumps(item) + '\n')
+
+
+def read_jsonl_as_dict(file_path):
+    out_dict = {}
+    with open(file_path, 'r') as f:
+        for line in f:
+            json_dict = json.loads(line)
+            out_dict.update(json_dict)
+    return out_dict

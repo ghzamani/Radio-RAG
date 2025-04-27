@@ -25,8 +25,9 @@ def chexpert_generate_predictions_in_batches(
        batch_size: Number of samples per batch.
 
    Returns:
-       refs (list): List of reference texts.
-       hyps (list): List of generated predictions.
+       refs_findings (list): List of dictionaries of findings.
+       refs_impression (list): List of dictionaries of impression.
+       hyps (list): List of dictionaries of generated predictions.
    """
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -51,7 +52,8 @@ def chexpert_generate_predictions_in_batches(
     hyps = []
 
     with torch.no_grad():
-        for pixel_values_batch, findings, impressions in tqdm(dataloader, desc="Generating predictions"):
+        for real_ids, pixel_values_batch, findings, impressions in tqdm(dataloader,
+                                                                        desc="Generating predictions"):
             pixel_values_batch = pixel_values_batch.to(device)
             # print(pixel_values_batch.get_device())
             # Generate predictions
@@ -68,9 +70,14 @@ def chexpert_generate_predictions_in_batches(
                 skip_special_tokens=True
             )
 
-            refs_findings.extend(findings)
-            refs_impression.extend(impressions)
-            hyps.extend(generated_texts)
+            for i in range(len(real_ids)):
+                hyps.append({real_ids[i]: generated_texts[i]})
+                refs_findings.append({real_ids[i]: findings[i]})
+                refs_impression.append({real_ids[i]: impressions[i]})
+
+            # refs_findings.extend(findings)
+            # refs_impression.extend(impressions)
+            # hyps.extend(generated_texts)
 
     return refs_findings, refs_impression, hyps
 
@@ -116,7 +123,7 @@ def maira_predict(model, processor, sample_data, device="cuda"):
         indication=None,
         technique=None,
         comparison=None,
-        prior_report=None,  # Our example has no prior
+        prior_report=sample_data["prior_report"],  # Our example has no prior
         return_tensors="pt",
         get_grounding=False,  # For this example we generate a non-grounded report
     )

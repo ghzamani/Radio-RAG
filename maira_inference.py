@@ -8,7 +8,7 @@ import torch
 from tqdm import tqdm
 
 from inference import maira_predict
-from utills import load_radio_bench, load_maira_model, save_list_to_txt
+from utills import load_radio_bench, load_maira_model, save_list_to_txt, read_jsonl_as_dict, save_list_to_jsonl
 
 
 def separate_chexpert(ch_plus):
@@ -92,20 +92,31 @@ def main():
     # get list of frontal and lateral indices for multi study patients
     multi_study_grouped = group_multi_study_patient(multi_study_patients)
 
+    output_path = "/home/m_nobakhtian/mmed/Radio-RAG/outputs"
+    chexpert_helper = False
+    chexpert_dict = {}
+    if chexpert_helper:
+        chexpert_output = 'chplus_findings_chexpert-mimic-cxr-impression_pred.jsonl'
+        chexpert_path = os.path.join(output_path, chexpert_output)
+        chexpert_dict = read_jsonl_as_dict(chexpert_path)
+
     # create a list of sample dictionaries
     samples = []
     # Process multi-study cases
     for curr_frontal, curr_lateral, prev_frontal in multi_study_grouped:
+        real_id = curr_frontal['real_id']
         samples.append({
+            "real_id": real_id,
             "current_frontal": curr_frontal['image'],
             "current_lateral": curr_lateral['image'],
             # when adding 3 images for one sample, got the error:
             # Token indices sequence length is longer than the specified maximum sequence length
             # "prior_frontal": prev_frontal['image'] if prev_frontal else None,
             "prior_frontal": None,
+            "prior_report": chexpert_dict.get(str(real_id)),
             "original_findings": curr_frontal['findings']
         })
-        # break
+        break
 
     # Process single-study cases
     for patient in single_study_patients:
@@ -113,29 +124,42 @@ def main():
         if not patient['findings'] or patient['frontal_lateral'] != 'Frontal':
             continue
 
+        real_id = patient['real_id']
         samples.append({
+            "real_id": real_id,
             "current_frontal": patient['image'],
             "current_lateral": None,
             "prior_frontal": None,
+            "prior_report": chexpert_dict.get(str(real_id)),
             "original_findings": patient['findings']
         })
-        # break
+        break
 
     reference_findings = []
     predicted_findings = []
     for sample in tqdm(samples):
         prediction = maira_predict(model, processor, sample)
-        predicted_findings.append(prediction)
-        reference_findings.append(sample["original_findings"])
+        predicted_findings.append({
+            sample['real_id']: prediction
+        })
+        reference_findings.append({
+            sample['real_id']: sample["original_findings"]
+        })
 
     assert len(predicted_findings) == len(samples)
-
-    output_path = "/home/m_nobakhtian/mmed/Radio-RAG/outputs"
+    # print(predicted_findings)
+    # print(reference_findings)
     # name format: {dataset}_{impression/findings}_model_{ref/pred}
-    save_list_to_txt(predicted_findings, os.path.join(output_path,
-                                                      'chplus_findings_maira_pred.txt'))
-    save_list_to_txt(reference_findings, os.path.join(output_path,
-                                                      'chplus_findings_maira_ref.txt'))
+    # save_list_to_txt(predicted_findings, os.path.join(output_path,
+    #                                                   'chplus_findings_maira_pred.txt'))
+    # save_list_to_txt(reference_findings, os.path.join(output_path,
+    #                                                   'chplus_findings_maira_ref.txt'))
+    # saving results to file
+    # save_list_to_jsonl(predicted_findings, os.path.join(output_path,
+    #                                                     # 'chplus_findings_maira_with_prior_pred.jsonl'))
+    #                                                     'chplus_findings_maira_without_prior_pred.jsonl'))
+    # save_list_to_jsonl(reference_findings, os.path.join(output_path,
+    #                                                     'chplus_findings_maira_ref.jsonl'))
 
 if __name__ == "__main__":
     main()
