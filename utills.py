@@ -49,6 +49,22 @@ def load_radio_bench():
     return ch_plus
 
 
+def load_test_bench():
+    print("Loading dataset")
+    # radiology_bench = load_dataset("/mnt/disk2/ghazal.zamaninezhad/data/test_radio")
+    radiology_bench = load_dataset(
+        "parquet",
+        data_files={
+            "validation": "/mnt/disk2/ghazal.zamaninezhad/data/test_radio/data/validation-*.parquet",
+            # "test": "/mnt/disk2/ghazal.zamaninezhad/data/test_radio/data/test-*.parquet"
+        },
+        cache_dir="/mnt/disk2/ghazal.zamaninezhad/hf_cache"
+    )
+    print(f"Number of validation samples: {len(radiology_bench['validation'])}")
+    # print(f"Number of test samples: {len(radiology_bench['test'])}")
+    return radiology_bench
+
+
 def save_list_to_txt(my_list, file_path):
     with open(file_path, "w") as f:
         for item in my_list:
