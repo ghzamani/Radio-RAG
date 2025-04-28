@@ -3,6 +3,8 @@ from datasets import load_dataset
 from transformers import (AutoModelForCausalLM, AutoProcessor,
                           BertTokenizer, ViTImageProcessor,
                           VisionEncoderDecoderModel)
+import numpy as np
+import torchxrayvision as xrv
 import torch
 
 
@@ -64,6 +66,16 @@ def load_test_bench():
     # print(f"Number of test samples: {len(radiology_bench['test'])}")
     return radiology_bench
 
+def xray_transform(img, transform):
+    # Prepare the image:
+    img = np.array(img)
+    img = xrv.datasets.normalize(img, 255)  # convert 8-bit image to [-1024, 1024] range
+    # TODO ? handle RGB images (as it is in their repo)
+    img = img[None, ...]
+
+    img = transform(img)
+    img = torch.from_numpy(img)
+    return img
 
 def save_list_to_txt(my_list, file_path):
     with open(file_path, "w") as f:

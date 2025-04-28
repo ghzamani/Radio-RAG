@@ -1,22 +1,11 @@
 import faiss
-import skimage, torch, torchvision
+import torch, torchvision
 import numpy as np
 import torchxrayvision as xrv
 import pickle
+from tqdm import tqdm
 
-from utills import load_test_bench
-
-
-def xray_transform(img, transform):
-    # Prepare the image:
-    img = np.array(img)
-    img = xrv.datasets.normalize(img, 255)  # convert 8-bit image to [-1024, 1024] range
-    # TODO ? handle RGB images (as it is in their repo)
-    img = img[None, ...]
-
-    img = transform(img)
-    img = torch.from_numpy(img)
-    return img
+from utills import load_test_bench, xray_transform
 
 
 def save_to_database(vector, db_name):
@@ -39,29 +28,28 @@ def main():
     transform = torchvision.transforms.Compose(
         [xrv.datasets.XRayCenterCrop(), xrv.datasets.XRayResizer(224)])
     # load model
-    # weight_path = "/mnt/disk2/ghazal.zamaninezhad/models/densenet121-res224-mimic_ch.pt"
-    model = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch",
+    # model = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch",
+    model = xrv.models.DenseNet(weights="densenet121-res224-chex",
                                 cache_dir="/mnt/disk2/ghazal.zamaninezhad/hf_cache")
-    # put model on gpu
+    # take model to gpu
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = model.to(device)
 
-    processed_images = []
+    # processed_images = []
+    outputs = []
     reports = []
-    for sample in dataset['validation'].select(range(5)):
-        transformed = xray_transform(sample['image'], transform)
-        processed_images.append(transformed)
+    for sample in tqdm(dataset['validation'].select(range(100))):
+        transformed = xray_transform(sample['image'], transform).to(device)
+        # predict on dataset
+        pred = model(transformed).flatten()
+        outputs.append(pred.cpu().detach().numpy())
         reports.append(sample['report'])
 
-    print()
-    # batched_images = np.stack(processed_images, axis=0)
-    # # predict labels for dataset
-    # outputs = model(batched_images)
-    # print(outputs.shape)
-    # labels_index = save_to_database(outputs, "label_vector.index")
-    #
-    # with open("index_to_report.pkl", "wb") as f:
-    #     pickle.dump(reports, f)
+    labels_vector = np.vstack(outputs)
+    labels_index = save_to_database(labels_vector, "label_vector.index")
+
+    with open("index_to_report.pkl", "wb") as f:
+        pickle.dump(reports, f)
 
 
 if __name__ == '__main__':
