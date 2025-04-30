@@ -3,6 +3,7 @@ import pickle
 import torch, torchvision
 import numpy as np
 import torchxrayvision as xrv
+import openai
 
 from utills import load_test_bench, xray_transform
 
@@ -17,6 +18,49 @@ def retrieve_most_similar(predicted_label_vector, vector_index, reports, k=5):
     # Retrieve reports
     retrieved_reports = [reports[idx] for idx in indices[0]]
     return retrieved_reports
+
+
+def build_prompt(label_vector, label_names, retrieved_reports, threshold=0.5):
+    # Convert label vector to readable findings
+    findings = "\n".join(
+        f"- {label_names[i]}: {round(val, 2)}"
+        for i, val in enumerate(label_vector[0])
+        if val >= threshold
+    )
+
+    # Add retrieved reports
+    similar_reports = "\n".join(
+        f"Report {i+1}:\n{report}" for i, report in enumerate(retrieved_reports)
+    )
+
+    # Final prompt
+    prompt = f"""You are a radiologist. Based on the following predicted findings and similar historical reports, write a new radiology report.
+
+Predicted findings:
+{findings}
+
+Retrieved similar reports:
+{similar_reports}
+
+Write the new report below:
+Report: 
+
+"""
+    return prompt
+
+
+def call_gpt(prompt, model="gpt-4o-mini"):
+    response = openai.ChatCompletion.create(
+        model=model,
+        messages=[
+            {"role": "system",
+             "content": "You are an expert radiologist generating chest X-ray reports."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0,
+        max_tokens=500
+    )
+    return response['choices'][0]['message']['content']
 
 
 def main():
@@ -39,14 +83,25 @@ def main():
         reports = pickle.load(f)
 
     samples_similar_reports = []
+    predicted_labels = []
     for sample in samples:
         # predict labels for input image
         transformed = xray_transform(sample['image'], transform).to(device)
         # predict on dataset
         pred = model(transformed).flatten()
         pred = pred.cpu().detach().numpy()
+        predicted_labels.append(pred)
         similar_reports = retrieve_most_similar(pred, index, reports, k=5)
         samples_similar_reports.append(similar_reports)
+
+
+    openai.api_key = "dummy"
+    for labels, similar_reports in zip(predicted_labels, samples_similar_reports):
+        prompt = build_prompt(labels, model.pathologies, similar_reports)
+        print(prompt)
+        # new_report = call_gpt(prompt)
+        # print(new_report)
+        break
 
 
 if __name__ == '__main__':
