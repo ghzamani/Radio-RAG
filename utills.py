@@ -6,7 +6,7 @@ from transformers import (AutoModelForCausalLM, AutoProcessor,
 import numpy as np
 import torchxrayvision as xrv
 import torch
-
+import re
 
 def load_chexpert_model(model_name_or_path="IAMJB/chexpert-mimic-cxr-impression-baseline",
                         eval_mode=True):
@@ -76,6 +76,28 @@ def xray_transform(img, transform):
     img = transform(img)
     img = torch.from_numpy(img)
     return img
+
+import re
+
+def extract_sections(report_text):
+    findings = ""
+    impression = ""
+
+    # Normalize case
+    # text = report_text.upper()
+
+    # Pattern for FINDINGS
+    findings_match = re.search(r"FINDINGS:\s*(.*?)(IMPRESSION:|SUMMARY|END OF IMPRESSION|INDICATION:|TECHNIQUE:|ACCESSION NUMBER|BY:|$)", report_text, re.DOTALL)
+    if findings_match:
+        findings = findings_match.group(1).strip()
+
+    # Pattern for IMPRESSION
+    impression_match = re.search(r"IMPRESSION:\s*(.*?)(END OF IMPRESSION|SUMMARY|BY:|$)", report_text, re.DOTALL)
+    if impression_match:
+        impression = impression_match.group(1).strip()
+
+    return findings, impression
+
 
 def save_list_to_txt(my_list, file_path):
     with open(file_path, "w") as f:
