@@ -1,5 +1,5 @@
 import os
-os.environ['HF_HOME'] = "/home/m_nobakhtian/mmed/hf_cache"
+# os.environ['HF_HOME'] = "/home/m_nobakhtian/mmed/hf_cache"
 
 import faiss
 import torch, torchvision
@@ -26,16 +26,16 @@ def save_to_database(vector, db_name):
 
 def main():
     # load dataset
-    # dataset = load_test_bench()
-    dataset = load_radio_bench()
+    dataset = load_test_bench()
+    # dataset = load_radio_bench()
     # specify transform
     transform = torchvision.transforms.Compose(
         [xrv.datasets.XRayCenterCrop(), xrv.datasets.XRayResizer(224)])
     # load model
-    # model = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch",
-    model = xrv.models.DenseNet(weights="densenet121-res224-chex",
-                                # cache_dir="/mnt/disk2/ghazal.zamaninezhad/hf_cache")
-                                cache_dir="/home/m_nobakhtian/mmed/hf_cache")
+    model = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch",
+    # model = xrv.models.DenseNet(weights="densenet121-res224-chex",
+                                cache_dir="/mnt/disk2/ghazal.zamaninezhad/hf_cache")
+                                # cache_dir="/home/m_nobakhtian/mmed/hf_cache")
     # take model to gpu
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = model.to(device)
@@ -43,8 +43,8 @@ def main():
     # processed_images = []
     outputs = []
     reports = []
-    # for sample in tqdm(dataset['validation'].select(range(100))):
-    for sample in tqdm(dataset.select(range(100))):
+    for sample in tqdm(dataset['test'].select(range(100)), desc="Predicting"):
+    # for sample in tqdm(dataset.select(range(100))):
         transformed = xray_transform(sample['image'], transform).to(device)
         # predict on dataset
         pred = model(transformed).flatten()
