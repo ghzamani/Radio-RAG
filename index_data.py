@@ -7,6 +7,7 @@ import numpy as np
 import torchxrayvision as xrv
 import pickle
 from tqdm import tqdm
+import pandas as pd
 
 from utills import load_test_bench, xray_transform, load_radio_bench
 
@@ -22,6 +23,21 @@ def save_to_database(vector, db_name):
     # Save FAISS index
     faiss.write_index(index, db_name)
     return index
+
+
+def find_studies_path(root_dir):
+    studies_names = []
+    images_path = []
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        if not dirnames:  # If no subdirectories, it's a last folder
+            # add study name to a list
+            study_name = int(dirpath.split('/')[-1][1:])
+            studies_names.append(study_name)
+            # add images path to a list
+            images = [os.path.join(dirpath, file_path) for file_path in filenames if file_path.endswith(".jpg")]
+            if images:  # Only add if folder contains files
+                images_path.extend(images)
+    return studies_names, images_path
 
 
 def main():
@@ -59,4 +75,12 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    # main()
+    studies_names, images = find_studies_path("/mnt/disk2/ghazal.zamaninezhad/mimic/files/mimic-cxr-jpg/2.1.0/files/p15")
+    # read all the reports
+    report_sections = pd.read_csv("/mnt/disk2/ghazal.zamaninezhad/mimic/files/mimic-cxr-jpg/2.1.0/files/mimic_cxr_sectioned.csv")
+    # filter those reports which has both findings and impression
+    non_null_sections = report_sections[report_sections['findings'].notnull() & report_sections['impression'].notnull()]
+    # toke rows that belong to train data
+    related_non_null = non_null_sections[non_null_sections['study_id'].isin(studies_names)]
+    print(len(related_non_null))
