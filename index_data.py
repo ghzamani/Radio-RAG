@@ -83,25 +83,26 @@ def map_study_to_best_image(splits, metadata, report_sections):
     # count after omitting = 128032
     report_sections = report_sections[report_sections['impression'].notnull() & report_sections['findings'].notnull()]
     # concat findings and impression
+    # todo add impression and findings keyword before each?
     report_sections['report'] = report_sections['findings'] + report_sections['impression']
     # add reports to dataframe
     # count = 125417
     merged_df = pd.merge(df_train, report_sections, on="study_id", how="inner")
     return merged_df[['study_id', 'report', 'image_path']]
 
-def main():
-    # image_file_paths = "/root/codes/Radio-RAG/data/train_images_path.txt"
-    splits_path = "/root/codes/Radio-RAG/data/mimic-cxr-2.0.0-split.csv"
-    meta_path = "/root/codes/Radio-RAG/data/mimic-cxr-2.0.0-metadata.csv"
-    reports_path = "/root/codes/Radio-RAG/data/mimic_cxr_sectioned.csv"
 
-    # with open(image_file_paths, "r") as f:
-    #     images_path = f.read().splitlines()
+def main():
+    data_path = "/mnt/disk2/ghazal.zamaninezhad/codes/Radio-RAG/data/"
+    splits_path = data_path + "mimic-cxr-2.0.0-split.csv"
+    meta_path = data_path + "mimic-cxr-2.0.0-metadata.csv"
+    reports_path = data_path + "mimic_cxr_sectioned.csv"
+    images_path = "/volumes/hetzner/zamaninezhad/my_data/physionet.org/files/mimic-cxr-jpg/2.1.0/"
+    # images_path = "/mnt/hetzner/zamaninezhad/my_data/physionet.org/files/mimic-cxr-jpg/2.1.0/"
+
     splits = pd.read_csv(splits_path)
     metadata = pd.read_csv(meta_path)
     report_sections = pd.read_csv(reports_path)
 
-    # study_img_report = map_study_to_best_image(images_path, metadata, report_sections)
     study_img_report = map_study_to_best_image(splits, metadata, report_sections)
     # select 100 random rows from train data
     random_study_img_report = study_img_report.sample(n=100, random_state=42)
@@ -110,28 +111,29 @@ def main():
     transform = torchvision.transforms.Compose(
         [xrv.datasets.XRayCenterCrop(), xrv.datasets.XRayResizer(224)])
     # load model
-    model = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch")
+    model = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch",
     # model = xrv.models.DenseNet(weights="densenet121-res224-chex",
-    #                             cache_dir="/mnt/disk2/ghazal.zamaninezhad/hf_cache")
+                                cache_dir="/mnt/disk2/ghazal.zamaninezhad/hf_cache")
                                 # cache_dir="/home/m_nobakhtian/mmed/hf_cache")
     # take model to gpu
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = model.to(device)
 
-    # processed_images = []
+    # check which symptoms relate to this dataset
+    # find indices of pathologies (11 out of 18)
+    non_empty_indices = [i for i, name in enumerate(model.pathologies) if name]
     outputs = []
     reports = []
     for index, sample in tqdm(random_study_img_report.iterrows(),
                            total=len(random_study_img_report),
                            desc="Processing rows"):
-    # for sample in tqdm(dataset.select(range(100))):
-        full_path = "/mnt/hetzner/zamaninezhad/my_data/physionet.org/files/mimic-cxr-jpg/2.1.0/" + sample['image_path']
+        full_path = images_path + sample['image_path']
         img = skimage.io.imread(full_path)
         transformed = xray_transform(img, transform).to(device)
         # predict on dataset
         pred = model(transformed).flatten()
-        # check which symptoms relate to this dataset
-    
+        # Filter the vector using these indices
+        pred = pred[non_empty_indices]
         outputs.append(pred.cpu().detach().numpy())
         reports.append(sample['report'])
 
@@ -144,7 +146,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
-
-

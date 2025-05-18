@@ -57,13 +57,13 @@ def load_test_bench():
     radiology_bench = load_dataset(
         "parquet",
         data_files={
-            # "validation": "/mnt/disk2/ghazal.zamaninezhad/data/test_radio/data/validation-*.parquet",
-            "test": "/mnt/disk2/ghazal.zamaninezhad/data/test_radio/data/test-*.parquet"
+            "validation": "/mnt/disk2/ghazal.zamaninezhad/data/test_radio/data/validation-*.parquet",
+            # "test": "/mnt/disk2/ghazal.zamaninezhad/data/test_radio/data/test-*.parquet"
         },
         cache_dir="/mnt/disk2/ghazal.zamaninezhad/hf_cache"
     )
-    # print(f"Number of validation samples: {len(radiology_bench['validation'])}")
-    print(f"Number of test samples: {len(radiology_bench['test'])}")
+    print(f"Number of validation samples: {len(radiology_bench['validation'])}")
+    # print(f"Number of test samples: {len(radiology_bench['test'])}")
     return radiology_bench
 
 def xray_transform(img, transform):

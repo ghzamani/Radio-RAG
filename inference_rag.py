@@ -1,5 +1,5 @@
 import os
-os.environ['HF_HOME'] = "/home/m_nobakhtian/mmed/hf_cache"
+# os.environ['HF_HOME'] = "/home/m_nobakhtian/mmed/hf_cache"
 
 import faiss
 import pickle
@@ -7,6 +7,8 @@ import torch, torchvision
 import numpy as np
 import torchxrayvision as xrv
 from openai import OpenAI
+from datasets import load_dataset
+from tqdm import tqdm
 
 from utills import load_test_bench, xray_transform, load_radio_bench, extract_sections
 
@@ -40,25 +42,27 @@ def build_prompt(label_vector, label_names, retrieved_reports, threshold=0.55):
     similar_reports = ""
     # Add retrieved reports
     for i, report in enumerate(retrieved_reports):
-        findings, impression = extract_sections(report)
-        if not findings and not impression:
-            print("The report has neither findings nor impression")
-            continue
+        # findings, impression = extract_sections(report)
+        # if not findings and not impression:
+        #     print("The report has neither findings nor impression")
+        #     continue
         similar_reports += f"\n--- Report {i+1} ---\n"
-        if findings:
-            similar_reports += f"FINDINGS:\n{findings}\n"
-        if impression:
-            similar_reports += f"IMPRESSION:\n{impression}\n"
+        # if findings:
+        #     similar_reports += f"FINDINGS:\n{findings}\n"
+        # if impression:
+        #     similar_reports += f"IMPRESSION:\n{impression}\n"
+        similar_reports += f"{report}\n"
 
     # Final prompt
-    prompt = f"""You are a radiologist. Based on the following predicted findings and similar reports, write a new radiology report.
+    prompt = f"""You are a radiologist. Based on the following Findings and retrieved report excerpts, generate a radiology report that includes only the FINDINGS and IMPRESSION sections.
+
+Write in a concise, professional tone as used in real chest X-ray reports. Do not include patient identifiers, clinical history, or template headers.
 
 Findings:
 {predicted_findings}
 Retrieved similar reports:
 {similar_reports}
-New report:
-
+Now write a new FINDINGS and IMPRESSION section for a similar case.
 """
     return prompt
 
@@ -68,29 +72,31 @@ def call_gpt(client, prompt, model="gpt-4o-mini"):
         model=model,
         messages=[
             {"role": "system",
-             "content": "You are an expert radiologist generating chest X-ray reports."},
-            {"role": "user", "content": prompt}
+             "content": "You are a radiologist assistant generating accurate and concise chest X-ray reports."},
+            {"role": "user",
+             "content": prompt}
         ],
         temperature=0,
         max_tokens=300
     )
-    return response['choices'][0]['message']['content']
+    return response.choices[0].message.content
 
 
 def main():
     # radio_bench_val = load_test_bench()
-    radio_bench_val = load_radio_bench()
+    # radio_bench_val = load_radio_bench()
+    radio_bench_val = load_dataset("/mnt/disk2/ghazal.zamaninezhad/data/mimic_radio")['validation']
     # take first 5 examples
     # samples = radio_bench_val['validation'].select(range(5))
-    samples = radio_bench_val.select(range(200,210))
+    samples = radio_bench_val.select(range(300, 310))
     # specify transform
     transform = torchvision.transforms.Compose([xrv.datasets.XRayCenterCrop(),
                                                 xrv.datasets.XRayResizer(224)])
     # load model
-    # model = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch",
-    model = xrv.models.DenseNet(weights="densenet121-res224-chex",
-                                # cache_dir="/mnt/disk2/ghazal.zamaninezhad/hf_cache")
-                                cache_dir="/home/m_nobakhtian/mmed/hf_cache")
+    model = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch",
+    # model = xrv.models.DenseNet(weights="densenet121-res224-chex",
+                                cache_dir="/mnt/disk2/ghazal.zamaninezhad/hf_cache")
+                                # cache_dir="/home/m_nobakhtian/mmed/hf_cache")
     # take model to device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = model.to(device)
@@ -99,14 +105,19 @@ def main():
     with open("index_to_report.pkl", "rb") as f:
         reports = pickle.load(f)
 
+    # find indices of pathologies (11 out of 18)
+    non_empty_indices = [i for i, name in enumerate(model.pathologies) if name]
     samples_similar_reports = []
     predicted_labels = []
-    for sample in samples:
+    for sample in tqdm(samples,
+                       desc="Predicting pathologies on test data"):
         # predict labels for input image
         transformed = xray_transform(sample['image'], transform).to(device)
         # predict on dataset
         pred = model(transformed).flatten()
         pred = pred.cpu().detach().numpy()
+        # Filter the vector using these indices
+        pred = pred[non_empty_indices]
         predicted_labels.append(pred)
         similar_reports = retrieve_most_similar(pred, index, reports, k=5)
         samples_similar_reports.append(similar_reports)
@@ -116,10 +127,11 @@ def main():
         # timeout = 20.0
     )
     predicted_reports = []
-    for labels, similar_reports in zip(predicted_labels, samples_similar_reports):
+    for labels, similar_reports in tqdm(zip(predicted_labels, samples_similar_reports),
+                                        desc="Requesting GPT"):
         prompt = build_prompt(labels, model.pathologies, similar_reports)
         print(prompt)
-        print("Requesting GPT ...")
+        # print("Requesting GPT ...")
         new_report = call_gpt(client, prompt)
         predicted_reports.append(new_report)
         print(new_report)
