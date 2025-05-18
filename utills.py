@@ -77,7 +77,6 @@ def xray_transform(img, transform):
     img = torch.from_numpy(img)
     return img
 
-import re
 
 def extract_sections(report_text):
     findings = ""

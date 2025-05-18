@@ -15,7 +15,12 @@ def convert_to_dict(refs, hyps):
 
 
 def compute_scores(refs, hyps,
-                   metrics=["rouge", "bleu", "meteor", "bertscore", "chexbert", "radgraph"]):
+                   metrics=["rouge",
+                            "bleu",
+                            "meteor",
+                            "bertscore",
+                            "chexbert",
+                            "radgraph"]):
     scores = {}
     # If metric is None or empty list
     if metrics is None or not metrics:
