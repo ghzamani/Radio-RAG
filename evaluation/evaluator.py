@@ -14,17 +14,15 @@ def convert_to_dict(refs, hyps):
     return refs_dict, hyps_dict
 
 
-def compute_scores(refs, hyps,
-                   metrics=["rouge",
-                            "bleu",
-                            "meteor",
-                            "bertscore",
-                            "chexbert",
-                            "radgraph"]):
+def compute_scores(refs, hyps, metrics=None):
+    if metrics is None:
+        metrics = ["rouge",
+                   "bleu",
+                   "meteor",
+                   "bertscore",
+                   "chexbert",
+                   "radgraph"]
     scores = {}
-    # If metric is None or empty list
-    if metrics is None or not metrics:
-        return scores
 
     assert refs is not None and hyps is not None, \
         "You specified metrics but your evaluation does not return hyps nor refs"

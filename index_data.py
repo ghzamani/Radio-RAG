@@ -11,33 +11,27 @@ import pandas as pd
 import random
 import skimage
 
-# from utills import load_test_bench, xray_transform, load_radio_bench
-
-
-def xray_transform(img, transform):
-    # Prepare the image:
-    img = np.array(img)
-    img = xrv.datasets.normalize(img, 255)  # convert 8-bit image to [-1024, 1024] range
-    # TODO ? handle RGB images (as it is in their repo)
-    img = img[None, ...]
-
-    img = transform(img)
-    img = torch.from_numpy(img)
-    return img
+from utills import xray_transform
 
 
 def save_to_database(vector, db_name):
     label_vectors = np.array(vector).astype('float32')  # FAISS needs float32
     # Normalize vectors if you want cosine similarity
-    label_vectors = label_vectors / np.linalg.norm(label_vectors, axis=1, keepdims=True)
+    # label_vectors = label_vectors / np.linalg.norm(label_vectors, axis=1, keepdims=True)
     # Build FAISS index
     d = label_vectors.shape[1]  # dimension
-    index = faiss.IndexFlatIP(d)  # inner product = cosine similarity if normalized
+    # index = faiss.IndexFlatIP(d)  # inner product = cosine similarity if normalized
+    # implement Manhattan distance
+    index = faiss.IndexFlat(d, faiss.METRIC_L1)
     index.add(label_vectors)
     # Save FAISS index
     faiss.write_index(index, db_name)
     return index
 
+def format_report(row, add_delimiters=True):
+    if add_delimiters:
+        return f"FINDINGS: {row['findings'].strip()} \n IMPRESSION: {row['impression'].strip()}"
+    return row['findings'].strip() + row['impression'].strip()
 
 def map_study_to_best_image(splits, metadata, report_sections):
     view_position_mapping = {
@@ -84,7 +78,8 @@ def map_study_to_best_image(splits, metadata, report_sections):
     report_sections = report_sections[report_sections['impression'].notnull() & report_sections['findings'].notnull()]
     # concat findings and impression
     # todo add impression and findings keyword before each?
-    report_sections['report'] = report_sections['findings'] + report_sections['impression']
+    # full_text = report_sections['findings'] + report_sections['impression']
+    report_sections['report'] = report_sections.apply(format_report, axis=1)
     # add reports to dataframe
     # count = 125417
     merged_df = pd.merge(df_train, report_sections, on="study_id", how="inner")
@@ -92,12 +87,13 @@ def map_study_to_best_image(splits, metadata, report_sections):
 
 
 def main():
-    data_path = "/mnt/disk2/ghazal.zamaninezhad/codes/Radio-RAG/data/"
+    # data_path = "/mnt/disk2/ghazal.zamaninezhad/codes/Radio-RAG/data/"
+    data_path = "/root/codes/Radio-RAG/data/"
     splits_path = data_path + "mimic-cxr-2.0.0-split.csv"
     meta_path = data_path + "mimic-cxr-2.0.0-metadata.csv"
     reports_path = data_path + "mimic_cxr_sectioned.csv"
-    images_path = "/volumes/hetzner/zamaninezhad/my_data/physionet.org/files/mimic-cxr-jpg/2.1.0/"
-    # images_path = "/mnt/hetzner/zamaninezhad/my_data/physionet.org/files/mimic-cxr-jpg/2.1.0/"
+    # images_path = "/volumes/hetzner/zamaninezhad/my_data/physionet.org/files/mimic-cxr-jpg/2.1.0/"
+    images_path = "/mnt/hetzner/zamaninezhad/my_data/physionet.org/files/mimic-cxr-jpg/2.1.0/"
 
     splits = pd.read_csv(splits_path)
     metadata = pd.read_csv(meta_path)
@@ -111,9 +107,9 @@ def main():
     transform = torchvision.transforms.Compose(
         [xrv.datasets.XRayCenterCrop(), xrv.datasets.XRayResizer(224)])
     # load model
-    model = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch",
+    model = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch")
     # model = xrv.models.DenseNet(weights="densenet121-res224-chex",
-                                cache_dir="/mnt/disk2/ghazal.zamaninezhad/hf_cache")
+    #                             cache_dir="/mnt/disk2/ghazal.zamaninezhad/hf_cache")
                                 # cache_dir="/home/m_nobakhtian/mmed/hf_cache")
     # take model to gpu
     device = 'cuda' if torch.cuda.is_available() else 'cpu'

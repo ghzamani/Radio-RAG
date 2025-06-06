@@ -1,8 +1,8 @@
 import json
 from datasets import load_dataset
-from transformers import (AutoModelForCausalLM, AutoProcessor,
-                          BertTokenizer, ViTImageProcessor,
-                          VisionEncoderDecoderModel)
+# from transformers import (AutoModelForCausalLM, AutoProcessor,
+#                           BertTokenizer, ViTImageProcessor,
+#                           VisionEncoderDecoderModel)
 import numpy as np
 import torchxrayvision as xrv
 import torch
