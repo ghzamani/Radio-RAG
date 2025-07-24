@@ -8,7 +8,6 @@ import torchxrayvision as xrv
 import pickle
 from tqdm import tqdm
 import pandas as pd
-import random
 import skimage
 
 from utills import xray_transform
@@ -133,8 +132,10 @@ def main():
         outputs.append(pred.cpu().detach().numpy())
         reports.append(sample['report'])
 
-    labels_vector = np.vstack(outputs)
+    labels_vector = np.vstack(outputs) # shape: (num_samples, torch_xray_dimension) = (100, 11)
     labels_index = save_to_database(labels_vector, "label_vector.index")
+    # save vectors individually in a npy file. because they aren't accessible directly through faiss
+    np.save("symptoms_vectors.npy", labels_vector)
 
     with open("index_to_report.pkl", "wb") as f:
         pickle.dump(reports, f)

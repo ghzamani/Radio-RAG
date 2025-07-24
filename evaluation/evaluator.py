@@ -14,7 +14,7 @@ def convert_to_dict(refs, hyps):
     return refs_dict, hyps_dict
 
 
-def compute_scores(refs, hyps, metrics=None):
+def compute_scores(refs, hyps, output_name=None, metrics=None):
     if metrics is None:
         metrics = ["rouge",
                    "bleu",
@@ -74,7 +74,8 @@ def compute_scores(refs, hyps, metrics=None):
             case _:
                 print(f"{metric} not implemented")
 
-    # with open("scores.json", "w") as f:
-    #     json.dump(scores, f, indent=4, sort_keys=True)
+    if output_name:
+        with open(output_name, "w") as f:
+            json.dump(scores, f, indent=4, sort_keys=True)
 
     return scores
