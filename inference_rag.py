@@ -14,6 +14,8 @@ import random
 # from utills import load_test_bench, xray_transform, load_radio_bench, extract_sections
 from utills import xray_transform
 
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
 
 def retrieve_most_similar(predicted_label_vector, vector_index, reports, k=5):
     query_vector = np.array(predicted_label_vector).astype('float32')
@@ -136,52 +138,55 @@ def save_result(input_list, file_path):
             data = {idx: item}
             f.write(json.dumps(data) + '\n')
 
-def main():
-    # radio_bench_val = load_test_bench()
-    # radio_bench_val = load_radio_bench()
-    # radio_bench_val = load_dataset("/mnt/disk2/ghazal.zamaninezhad/data/mimic_radio")['validation']
-    radio_bench_val = load_dataset("ghazal-zamani/mimic_radio")['validation']
+
+def load_and_prepare_samples(max_samples=50, split='validation'):
+    assert split in ['validation', 'test']
+
+    radio_bench_val = load_dataset("ghazal-zamani/mimic_radio")[split]
+    samples, gold_impression, gold_findings = [], [], []
     # TODO only take samples with both impression and findings? in order to evaluate
-    # coulnd't apply filter because of low RAM
+    # couldn't apply filter because of low RAM
     # radio_bench_val = radio_bench_val.filter(non_null_finding_impression)
-    samples = []
-    gold_impression = []
-    gold_findings = []
-    for s in tqdm(radio_bench_val):
+    for s in tqdm(radio_bench_val, desc="Filtering samples"):
         if s['impression'] and s['findings']:
             samples.append(s)
             gold_impression.append(s['impression'])
             gold_findings.append(s['findings'])
-        if len(samples) == 50:
+        if len(samples) == max_samples:
             break
+    return samples, gold_impression, gold_findings
 
-    # specify transform
-    transform = torchvision.transforms.Compose([xrv.datasets.XRayCenterCrop(),
-                                                xrv.datasets.XRayResizer(224)])
-    # load model
+
+def load_model_and_resources():
+    transform = torchvision.transforms.Compose([
+        xrv.datasets.XRayCenterCrop(),
+        xrv.datasets.XRayResizer(224)
+    ])
     model = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch")
-    # model = xrv.models.DenseNet(weights="densenet121-res224-chex",
-    #                             cache_dir="/mnt/disk2/ghazal.zamaninezhad/hf_cache")
-                                # cache_dir="/home/m_nobakhtian/mmed/hf_cache")
-    # take model to device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = model.to(device)
-    # load vector database
-    # index = faiss.read_index("label_vector.index")
-    # load reports
+    model = model.to(DEVICE)
+
+    index = faiss.read_index("label_vector.index")
     with open("index_to_report.pkl", "rb") as f:
         original_reports = pickle.load(f)
-    # load original vectors saved in db
     db_vectors = np.load("symptoms_vectors.npy")
+    non_empty_indices = [i for i, name in enumerate(model.pathologies) if name]
 
+    return model, transform, non_empty_indices, index, original_reports, db_vectors
+
+
+def predict_retrieve(model, transform, samples, db_vectors, original_reports,
+                     top_k_symptoms=3, retrieved_k_reports=3, randomly=False):
     # find indices of pathologies (11 out of 18)
     non_empty_indices = [i for i, name in enumerate(model.pathologies) if name]
+    # a list in which each item is a list of retrieved reports
     samples_similar_reports = []
     predicted_labels = []
+    # if we want to read a file instead of predicting,
+    # then need a mapping from study_id to impression and findings
     for sample in tqdm(samples,
                        desc="Predicting pathologies on test data"):
         # predict labels for input image
-        transformed = xray_transform(sample['image'], transform).to(device)
+        transformed = xray_transform(sample['image'], transform).to(DEVICE)
         # predict on dataset
         pred = model(transformed).flatten()
         pred = pred.cpu().detach().numpy()
@@ -189,36 +194,77 @@ def main():
         pred = pred[non_empty_indices]
         predicted_labels.append(pred)
         # similar_reports = retrieve_most_similar(pred, index, original_reports, k=5)
-        # add no retrieved report to check whether rag has any effect
-        # TODO IMPORTANT
+
+        # TODO pay attention to randomly boolean
         dict_symptom_reports = retrieve_for_top_symptoms(pred,
-                                                        db_vectors,
-                                                        original_reports,
-                                                        top_k_symptoms=2,
-                                                        retrieved_k_reports=3,
-                                                        randomly=True)
+                                                         db_vectors,
+                                                         original_reports,
+                                                         top_k_symptoms=top_k_symptoms,
+                                                         retrieved_k_reports=retrieved_k_reports,
+                                                         randomly=randomly)
         similar_reports = []
         for reps in dict_symptom_reports.values():
             similar_reports.extend(reps)
         samples_similar_reports.append(similar_reports)
+    return predicted_labels, samples_similar_reports
 
+
+def all_experiments():
+    all_experiment_modes = ['no_rag', 'rag', 'random_rag']
+    experiment_mode = 'no_rag'
+    assert experiment_mode in all_experiment_modes
+
+    retrieve_needed = True
+    random_documents = False
+
+    if experiment_mode == 'no_rag':
+        retrieve_needed = False
+    if experiment_mode == 'random_rag':
+        random_documents = True
+
+    dir_name = "exp3/ "
+    # load samples and ground truth
+    samples, gold_impression, gold_findings = load_and_prepare_samples(max_samples=50)
+    # load model and vector database
+    model, transform, non_empty_indices, index, original_reports, db_vectors = load_model_and_resources()
+    # predict txr on each sample and retrieve documents
+    predicted_labels, samples_similar_reports = predict_retrieve(model, transform, samples, db_vectors, original_reports,
+                                                                 top_k_symptoms=2,
+                                                                 retrieved_k_reports=3,
+                                                                 randomly=random_documents)
     client = OpenAI(
         api_key=os.environ.get("API_KEY")
     )
     predicted_reports = []
     for labels, similar_reports in tqdm(zip(predicted_labels, samples_similar_reports),
                                         desc="Requesting GPT"):
-        # TODO IMPORTANT!
-        prompt = build_prompt(labels, model.pathologies, similar_reports)
-        # prompt = build_prompt(labels, model.pathologies, similar_reports, retrieved=False)
+        # TODO pay attention to retrieved boolean!
+        prompt = build_prompt(labels, model.pathologies, similar_reports, retrieved=retrieve_needed)
         new_report = call_gpt(client, prompt)
         predicted_reports.append(new_report)
-        # break
-    # dir_name = "exp2_no_rag/ "
-    dir_name = "exp3/ "
+        break
+
     save_result(gold_impression, dir_name + "gold_impressions.jsonl")
     save_result(gold_findings, dir_name + "gold_findings.jsonl")
     save_result(predicted_reports, dir_name + "predicted_reports.jsonl")
+
+
+def study_based_experiment():
+    # I created a dict mapping study_id -> gold_impression, gold_findings in colab
+    # for those samples which have both impression and findings
+    # also, we have a dict mapping study_id -> txr vector (max values)
+    # what todo next?
+    # read both dicts
+    # iterate through first one, find it in the second
+    # send request to gpt
+    # evaluate
+
+    pass
+
+
+def main():
+    # all_experiments()
+    study_based_experiment()
 
 if __name__ == '__main__':
     main()
