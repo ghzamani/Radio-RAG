@@ -99,6 +99,7 @@ Write in a concise, professional tone as used in real chest X-ray reports. Do no
 
 Findings:
 {predicted_findings}
+
 Retrieved similar reports:
 {similar_reports}
 Now write a new FINDINGS and IMPRESSION section for a similar case.
@@ -110,6 +111,7 @@ Write in a concise, professional tone as used in real chest X-ray reports. Do no
 
 Findings:
 {predicted_findings}
+
 Now write a new FINDINGS and IMPRESSION section for this case.
 """
     return prompt
@@ -208,6 +210,42 @@ def predict_retrieve(model, transform, samples, db_vectors, original_reports,
         samples_similar_reports.append(similar_reports)
     return predicted_labels, samples_similar_reports
 
+def run_gpt_reporting_step(predicted_labels,
+                           samples_similar_reports,
+                           model,
+                           gold_impression,
+                           gold_findings,
+                           dir_name,
+                           retrieve_needed=True):
+    """
+    Calls GPT to generate reports from predicted labels and similar reports.
+    Saves the gold and predicted reports to disk.
+
+    Parameters:
+    - predicted_labels: list of label vectors
+    - samples_similar_reports: list of retrieved text samples per case
+    - model: the XRV model with .pathologies attribute
+    - gold_impression: list of ground truth impressions
+    - gold_findings: list of ground truth findings
+    - dir_name: where to save the outputs (should end with '/')
+    - retrieve_needed: whether to tell the prompt builder that retrieval was used
+    """
+    client = OpenAI(
+        # api_key=os.environ.get("API_KEY")
+    )
+    predicted_reports = []
+
+    for labels, similar_reports in tqdm(zip(predicted_labels, samples_similar_reports),
+                                        desc="Requesting GPT"):
+        prompt = build_prompt(labels, model.pathologies, similar_reports, retrieved=retrieve_needed)
+        new_report = call_gpt(client, prompt)
+        predicted_reports.append(new_report)
+        # break  # for debugging
+
+    save_result(gold_impression, dir_name + "gold_impressions.jsonl")
+    save_result(gold_findings, dir_name + "gold_findings.jsonl")
+    save_result(predicted_reports, dir_name + "predicted_reports.jsonl")
+
 
 def all_experiments():
     all_experiment_modes = ['no_rag', 'rag', 'random_rag']
@@ -232,35 +270,69 @@ def all_experiments():
                                                                  top_k_symptoms=2,
                                                                  retrieved_k_reports=3,
                                                                  randomly=random_documents)
-    client = OpenAI(
-        api_key=os.environ.get("API_KEY")
-    )
-    predicted_reports = []
-    for labels, similar_reports in tqdm(zip(predicted_labels, samples_similar_reports),
-                                        desc="Requesting GPT"):
-        # TODO pay attention to retrieved boolean!
-        prompt = build_prompt(labels, model.pathologies, similar_reports, retrieved=retrieve_needed)
-        new_report = call_gpt(client, prompt)
-        predicted_reports.append(new_report)
-        break
 
-    save_result(gold_impression, dir_name + "gold_impressions.jsonl")
-    save_result(gold_findings, dir_name + "gold_findings.jsonl")
-    save_result(predicted_reports, dir_name + "predicted_reports.jsonl")
-
+    # TODO pay attention to retrieved boolean!
+    run_gpt_reporting_step(predicted_labels, samples_similar_reports,
+                           model, gold_impression, gold_findings,
+                           dir_name, retrieve_needed)
 
 def study_based_experiment():
-    # I created a dict mapping study_id -> gold_impression, gold_findings in colab
-    # for those samples which have both impression and findings
-    # also, we have a dict mapping study_id -> txr vector (max values)
-    # what todo next?
-    # read both dicts
-    # iterate through first one, find it in the second
-    # send request to gpt
-    # evaluate
+    """
+    I created a dict mapping study_id -> gold_impression, gold_findings in colab
+    for those samples which have both impression and findings
+    also, we have a dict mapping study_id -> txr vector (max values)
 
-    pass
+    - read both dicts
+    - iterate through first one, find it in the second
+    - send request to gpt
+    """
 
+    split = "val"
+    with open(f"./data/aggregated_scores_{split}.pkl", "rb") as f:
+        aggregated_scores = pickle.load(f)
+        # we have 1808 studies (2991 total images)
+
+    # a dict mapping study_id to ground_truth impression & findings
+    # only for samples having both
+    with open(f"./data/study_to_gold_{split}.pkl", "rb") as f:
+        study_ground_truth = pickle.load(f)
+        # we have 991 studies with both impression and findings
+        # load model and vector database
+    model, transform, non_empty_indices, index, original_reports, db_vectors = load_model_and_resources()
+
+    gold_impression = []
+    gold_findings = []
+    samples_similar_reports = []
+    predicted_labels = []
+
+    count = 0
+    for study_id, gt in study_ground_truth.items():
+        gold_impression.append(gt['impression'])
+        gold_findings.append(gt['findings'])
+        # get the txr vector
+        txr_predicted = aggregated_scores[study_id]
+        # retrieve related docs for each
+        dict_symptom_reports = retrieve_for_top_symptoms(txr_predicted,
+                                                         db_vectors,
+                                                         original_reports,
+                                                         top_k_symptoms=2,
+                                                         retrieved_k_reports=3,
+                                                         randomly=False)
+        similar_reports = []
+        for reps in dict_symptom_reports.values():
+            similar_reports.extend(reps)
+        samples_similar_reports.append(similar_reports)
+        predicted_labels.append(txr_predicted)
+        count += 1
+        if count == 50:
+            break
+
+    dir_name = 'study_exp1/'
+    retrieve_needed = True
+    # TODO pay attention to retrieved boolean!
+    run_gpt_reporting_step(predicted_labels, samples_similar_reports,
+                           model, gold_impression, gold_findings,
+                           dir_name, retrieve_needed)
 
 def main():
     # all_experiments()
