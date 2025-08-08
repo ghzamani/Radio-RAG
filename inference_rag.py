@@ -67,13 +67,18 @@ def retrieve_for_top_symptoms(query_vector, symptom_database_vectors, reports,
     return similar_reports_per_symptom
 
 
-def build_prompt(label_vector, label_names, retrieved_reports, threshold=0.55, retrieved=True):
+def build_prompt(label_vector, label_names, retrieved_reports,
+                 threshold=0.55, retrieved=True, binarized=False):
     # Convert label vector to readable findings
     label_list = label_vector.tolist()
     # Filter out None names and create valid pairs
     valid_pairs = [(v, n) for v, n in zip(label_list, label_names) if n]
     # Get items above threshold
-    above_threshold = [f"- {n}: {round(v, 2)}" for v, n in valid_pairs if v >= threshold]
+    if not binarized:
+        above_threshold = [f"- {n}: {round(v, 2)}" for v, n in valid_pairs if v >= threshold]
+    # only add names, not values
+    else:
+        above_threshold = [f"- {n}" for v, n in valid_pairs if v >= threshold]
 
     if above_threshold:
         predicted_findings = "\n".join(above_threshold)
@@ -83,7 +88,10 @@ def build_prompt(label_vector, label_names, retrieved_reports, threshold=0.55, r
     else:
         # Get top 3 and format
         top3 = sorted(valid_pairs, key=lambda x: x[0], reverse=True)[:3]
-        predicted_findings = "\n".join(f"- {n}: {round(v, 2)}" for v, n in top3)
+        if binarized:
+            predicted_findings = "\n".join(f"- {n}: {round(v, 2)}" for v, n in top3)
+        else:
+            predicted_findings = "\n".join(f"- {n}" for _, n in top3)
 
     similar_reports = ""
     # Add retrieved reports
@@ -135,6 +143,7 @@ def non_null_finding_impression(row):
     return row['findings'] and row['impression']
 
 def save_result(input_list, file_path):
+    # todo create directory if doesn't exist
     with open(file_path, "w") as f:
         for idx, item in enumerate(input_list):
             data = {idx: item}
@@ -159,7 +168,7 @@ def load_and_prepare_samples(max_samples=50, split='validation'):
     return samples, gold_impression, gold_findings
 
 
-def load_model_and_resources():
+def load_model_and_resources(base_path=''):
     transform = torchvision.transforms.Compose([
         xrv.datasets.XRayCenterCrop(),
         xrv.datasets.XRayResizer(224)
@@ -167,10 +176,10 @@ def load_model_and_resources():
     model = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch")
     model = model.to(DEVICE)
 
-    index = faiss.read_index("label_vector.index")
-    with open("index_to_report.pkl", "rb") as f:
+    index = faiss.read_index(f"{base_path}/label_vector.index")
+    with open(f"{base_path}/index_to_report.pkl", "rb") as f:
         original_reports = pickle.load(f)
-    db_vectors = np.load("symptoms_vectors.npy")
+    db_vectors = np.load(f"{base_path}/symptoms_vectors.npy")
     non_empty_indices = [i for i, name in enumerate(model.pathologies) if name]
 
     return model, transform, non_empty_indices, index, original_reports, db_vectors
@@ -216,7 +225,9 @@ def run_gpt_reporting_step(predicted_labels,
                            gold_impression,
                            gold_findings,
                            dir_name,
-                           retrieve_needed=True):
+                           threshold=0.55,
+                           retrieve_needed=True,
+                           binarized=False):
     """
     Calls GPT to generate reports from predicted labels and similar reports.
     Saves the gold and predicted reports to disk.
@@ -237,7 +248,10 @@ def run_gpt_reporting_step(predicted_labels,
 
     for labels, similar_reports in tqdm(zip(predicted_labels, samples_similar_reports),
                                         desc="Requesting GPT"):
-        prompt = build_prompt(labels, model.pathologies, similar_reports, retrieved=retrieve_needed)
+        prompt = build_prompt(labels, model.pathologies, similar_reports,
+                              threshold=threshold,
+                              retrieved=retrieve_needed,
+                              binarized=binarized)
         new_report = call_gpt(client, prompt)
         predicted_reports.append(new_report)
         # break  # for debugging
@@ -260,11 +274,12 @@ def all_experiments():
     if experiment_mode == 'random_rag':
         random_documents = True
 
-    dir_name = "exp3/ "
+    # dir_name = "exp3/ "
+    dir_name = "test/ "
     # load samples and ground truth
     samples, gold_impression, gold_findings = load_and_prepare_samples(max_samples=50)
     # load model and vector database
-    model, transform, non_empty_indices, index, original_reports, db_vectors = load_model_and_resources()
+    model, transform, non_empty_indices, index, original_reports, db_vectors = load_model_and_resources(base_path='./embeddings')
     # predict txr on each sample and retrieve documents
     predicted_labels, samples_similar_reports = predict_retrieve(model, transform, samples, db_vectors, original_reports,
                                                                  top_k_symptoms=2,
@@ -298,7 +313,8 @@ def study_based_experiment():
         study_ground_truth = pickle.load(f)
         # we have 991 studies with both impression and findings
         # load model and vector database
-    model, transform, non_empty_indices, index, original_reports, db_vectors = load_model_and_resources()
+    model, transform, non_empty_indices, index, original_reports, db_vectors = load_model_and_resources(
+        base_path='./embeddings')
 
     gold_impression = []
     gold_findings = []
@@ -326,13 +342,20 @@ def study_based_experiment():
         count += 1
         if count == 50:
             break
-
-    dir_name = 'study_exp1/'
+    # using all train data in index
+    dir_name = 'study_exp6/'
     retrieve_needed = True
+    binarized = False
     # TODO pay attention to retrieved boolean!
     run_gpt_reporting_step(predicted_labels, samples_similar_reports,
                            model, gold_impression, gold_findings,
-                           dir_name, retrieve_needed)
+                           dir_name,
+                           threshold=0.7, retrieve_needed=retrieve_needed, binarized=binarized)
+
+# important booleans:
+# retrieve_needed: whether use rag
+# binarized: whether include probabilities
+# randomly: whether use random documents instead of retrieving
 
 def main():
     # all_experiments()
