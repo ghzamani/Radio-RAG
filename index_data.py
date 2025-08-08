@@ -9,28 +9,35 @@ import pickle
 from tqdm import tqdm
 import pandas as pd
 import skimage
+from collections import defaultdict
+import glob
+import re
 
 from utills import xray_transform
 
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-def save_to_database(vector, db_name):
-    label_vectors = np.array(vector).astype('float32')  # FAISS needs float32
-    # Normalize vectors if you want cosine similarity
-    # label_vectors = label_vectors / np.linalg.norm(label_vectors, axis=1, keepdims=True)
-    # Build FAISS index
-    d = label_vectors.shape[1]  # dimension
-    # index = faiss.IndexFlatIP(d)  # inner product = cosine similarity if normalized
-    # implement Manhattan distance
-    index = faiss.IndexFlat(d, faiss.METRIC_L1)
-    index.add(label_vectors)
-    # Save FAISS index
-    faiss.write_index(index, db_name)
-    return index
+def clean_report(report: str) -> str:
+    # Split into findings and impression
+    parts = report.split("IMPRESSION:", 1)
+    if len(parts) == 2:
+        findings, impression = parts
+        # Clean extra spaces/newlines inside each section
+        findings = re.sub(r'\s+', ' ', findings).strip()
+        impression = re.sub(r'\s+', ' ', impression).strip()
+        # Rejoin with a single line break
+        return f"{findings}\nIMPRESSION: {impression}"
+    else:
+        # No IMPRESSION section — just clean the whole thing
+        return re.sub(r'\s+', ' ', report).strip()
 
 def format_report(row, add_delimiters=True):
+    # I forgot to clean them before writing to index.
+    # so do it later with clean_report function
     if add_delimiters:
         return f"FINDINGS: {row['findings'].strip()} \n IMPRESSION: {row['impression'].strip()}"
     return row['findings'].strip() + row['impression'].strip()
+
 
 def map_study_to_best_image(splits, metadata, report_sections):
     view_position_mapping = {
@@ -62,10 +69,12 @@ def map_study_to_best_image(splits, metadata, report_sections):
     meta_sorted = metadata.sort_values(by=["study_id", "view_priority"])
     # keep the most important view for each study
     # count = 227835
-    meta_important_views = meta_sorted.drop_duplicates(subset="study_id", keep="first")
+    # meta_important_views = meta_sorted.drop_duplicates(subset="study_id", keep="first")
 
     # only keep train rows from meta dataframe
-    df_train = meta_important_views[meta_important_views["study_id"].isin(train_unique_studies)]
+    # df_train = meta_important_views[meta_important_views["study_id"].isin(train_unique_studies)]
+    df_train = meta_sorted[meta_sorted["study_id"].isin(train_unique_studies)]
+    print(f"total train samples: {len(df_train)}")
     df_train['image_path'] = (
             'files/p' + df_train['subject_id'].astype(str).str[:2] + '/' +  # p10/
             'p' + df_train['subject_id'].astype(str) + '/' +  # p10003502/
@@ -80,9 +89,122 @@ def map_study_to_best_image(splits, metadata, report_sections):
     # full_text = report_sections['findings'] + report_sections['impression']
     report_sections['report'] = report_sections.apply(format_report, axis=1)
     # add reports to dataframe
-    # count = 125417
+    # count = 232855
     merged_df = pd.merge(df_train, report_sections, on="study_id", how="inner")
-    return merged_df[['study_id', 'report', 'image_path']]
+    print(f"total train samples with both imp & fin: {len(merged_df)}")
+    return merged_df[['study_id', 'ViewPosition', 'report', 'image_path']]
+    # I guess in the end we should have 125417 (train studies with both i,f)
+
+
+def save_partial_results(embed_dict, report_dict, chunk_id, out_dir='./embeddings'):
+    with open(f"{out_dir}/embed_dict_{chunk_id}.pkl", "wb") as f:
+        pickle.dump(embed_dict, f)
+    with open(f"{out_dir}/report_dict_{chunk_id}.pkl", "wb") as f:
+        pickle.dump(report_dict, f)
+    # np.save(f"{out_dir}/pooled_vectors_{chunk_id}.npy", pooled_vectors)
+    print(f"[Saved at step {chunk_id}]")
+
+
+def predict_txr_study_based(model, transform, df, images_path, label_idx,
+                            chunk_size=500, out_dir="embeddings"):
+    os.makedirs(out_dir, exist_ok=True)
+    study_embeddings = defaultdict(dict)
+    study_reports = {}
+
+
+    # chunk_id = 0
+    for i, row in tqdm(df.iterrows(), total=len(df), desc="Embedding images"):
+        study_id = row["study_id"]
+        view = row["ViewPosition"]
+        report = row["report"]
+        full_path = os.path.join(images_path, row["image_path"])
+
+        try:
+            img = skimage.io.imread(full_path)
+        except Exception as e:
+            print(f"Failed for {full_path}: {e}")
+            continue
+
+        transformed = xray_transform(img, transform).to(DEVICE)
+        with torch.no_grad():
+            scores = model(transformed).flatten()
+        scores = scores[label_idx]
+
+        study_embeddings[study_id][view] = scores.cpu()
+        study_reports[study_id] = report
+
+        if (i + 1) % chunk_size == 0:
+            save_partial_results(dict(study_embeddings),
+                                 study_reports,
+                                 i,
+                                 out_dir)
+            # empty ram
+            study_embeddings.clear()
+            study_reports.clear()
+            # chunk_id += 1
+
+    if study_embeddings:
+        save_partial_results(dict(study_embeddings),
+                             study_reports,
+                             i,
+                             out_dir)
+
+
+def aggregate_and_save_to_faiss(embed_dir, out_path, index_name):
+    print("Start aggregating results")
+    all_study_views = defaultdict(dict)
+
+    for embed_file in sorted(glob.glob(f"{embed_dir}/embed_dict_*.pkl")):
+        with open(embed_file, "rb") as f:
+            chunk = pickle.load(f)
+            for study_id, view_dict in chunk.items():
+                for view, tensor in view_dict.items():
+                    if view in all_study_views[study_id]:
+                        print(
+                            f"Duplicate view '{view}' found for study_id '{study_id}' in chunk '{embed_file}'")
+                    all_study_views[study_id][view] = tensor  # Overwrite if duplicate
+
+    all_embeddings = []
+    study_ids = []
+    all_reports = []
+    for study_id, view_dict in all_study_views.items():
+        view_tensors = torch.stack(list(view_dict.values()))
+        # mean got better result than max, so replace
+        # pooled = torch.max(view_tensors, dim=0).values.numpy()
+        pooled = torch.mean(view_tensors, dim=0).numpy()
+        all_embeddings.append(pooled)
+        study_ids.append(study_id)
+
+    # Collect reports in the same order
+    report_lookup = {}
+    for report_file in sorted(glob.glob(f"{embed_dir}/report_dict_*.pkl")):
+        with open(report_file, "rb") as f:
+            report_lookup.update(pickle.load(f))
+    for sid in study_ids:
+        try:
+            rep = report_lookup[sid]
+            # pre-process reports
+            rep = clean_report(rep)
+        except KeyError:
+            print(f"{sid} not found in report_lookup")
+            rep = ""
+        all_reports.append(rep)
+
+    # all_embeddings = np.array(all_embeddings).astype("float32")
+    all_embeddings = np.vstack(all_embeddings)
+    index = faiss.IndexFlat(all_embeddings.shape[1], faiss.METRIC_L1)
+    index.add(all_embeddings)
+    # write into vector database
+    faiss.write_index(index, f"{out_path}/{index_name}")
+
+    with open(f"{out_path}/index_to_report.pkl", "wb") as f:
+        pickle.dump(all_reports, f)
+    # consistency between indices and study ids
+    # I think that wouldn't be used
+    with open(f"{out_path}/index_to_study_id.pkl", "wb") as f:
+        pickle.dump(study_ids, f)
+    np.save(f"{out_path}/symptoms_vectors.npy", all_embeddings)
+
 
 
 def main():
@@ -91,55 +213,33 @@ def main():
     splits_path = data_path + "mimic-cxr-2.0.0-split.csv"
     meta_path = data_path + "mimic-cxr-2.0.0-metadata.csv"
     reports_path = data_path + "mimic_cxr_sectioned.csv"
-    # images_path = "/volumes/hetzner/zamaninezhad/my_data/physionet.org/files/mimic-cxr-jpg/2.1.0/"
-    images_path = "/mnt/hetzner/zamaninezhad/my_data/physionet.org/files/mimic-cxr-jpg/2.1.0/"
+    # images_root = "/volumes/hetzner/zamaninezhad/my_data/physionet.org/files/mimic-cxr-jpg/2.1.0/"
+    images_root = "/mnt/hetzner/zamaninezhad/my_data/physionet.org/files/mimic-cxr-jpg/2.1.0/"
 
     splits = pd.read_csv(splits_path)
     metadata = pd.read_csv(meta_path)
     report_sections = pd.read_csv(reports_path)
 
     study_img_report = map_study_to_best_image(splits, metadata, report_sections)
-    # select 100 random rows from train data
-    random_study_img_report = study_img_report.sample(n=100, random_state=42)
 
     # specify transform
     transform = torchvision.transforms.Compose(
         [xrv.datasets.XRayCenterCrop(), xrv.datasets.XRayResizer(224)])
     # load model
     model = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch")
-    # model = xrv.models.DenseNet(weights="densenet121-res224-chex",
-    #                             cache_dir="/mnt/disk2/ghazal.zamaninezhad/hf_cache")
-                                # cache_dir="/home/m_nobakhtian/mmed/hf_cache")
     # take model to gpu
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model = model.to(device)
+    model = model.to(DEVICE)
+    model.eval()
 
     # check which symptoms relate to this dataset
     # find indices of pathologies (11 out of 18)
-    non_empty_indices = [i for i, name in enumerate(model.pathologies) if name]
-    outputs = []
-    reports = []
-    for index, sample in tqdm(random_study_img_report.iterrows(),
-                           total=len(random_study_img_report),
-                           desc="Processing rows"):
-        full_path = images_path + sample['image_path']
-        img = skimage.io.imread(full_path)
-        transformed = xray_transform(img, transform).to(device)
-        # predict on dataset
-        pred = model(transformed).flatten()
-        # Filter the vector using these indices
-        pred = pred[non_empty_indices]
-        outputs.append(pred.cpu().detach().numpy())
-        reports.append(sample['report'])
+    valid_indices = [i for i, name in enumerate(model.pathologies) if name]
 
-    labels_vector = np.vstack(outputs) # shape: (num_samples, torch_xray_dimension) = (100, 11)
-    labels_index = save_to_database(labels_vector, "label_vector.index")
-    # save vectors individually in a npy file. because they aren't accessible directly through faiss
-    np.save("symptoms_vectors.npy", labels_vector)
-
-    with open("index_to_report.pkl", "wb") as f:
-        pickle.dump(reports, f)
+    predict_txr_study_based(model, transform, study_img_report, images_root, valid_indices,
+                            chunk_size=500, out_dir="embeddings")
+    aggregate_and_save_to_faiss("embeddings", "embeddings", "l1.index")
 
 
 if __name__ == '__main__':
-    main()
+    # main()
+    aggregate_and_save_to_faiss("embeddings", "train_index", "l1.index")
