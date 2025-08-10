@@ -11,11 +11,37 @@ from datasets import load_dataset
 from tqdm import tqdm
 import json
 import random
+import yaml
+import wandb
+
 # from utills import load_test_bench, xray_transform, load_radio_bench, extract_sections
 from utills import xray_transform
+from eval import evaluate_reports
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
+RETRIEVAL_SYS_PROMPT = """You are an expert radiologist specializing in chest X-rays.  
+Your task is to generate only the FINDINGS and IMPRESSION sections of a chest X-ray report.  
+
+Follow these rules:
+- Base your report on the provided FINDINGS and retrieved similar reports for guidance.  
+- Write in a concise, professional tone used in real radiology reports.
+- Do NOT copy text verbatim from retrieved reports unless medically appropriate.  
+- Do NOT mention any numeric scores, probabilities, confidence values, or thresholds in the report text.
+- Do NOT include patient identifiers, clinical history, or section headers other than FINDINGS and IMPRESSION.  
+- Use complete sentences and standard medical terminology.  
+"""
+
+NON_RETRIEVAL_SYS_PROMPT = """You are an expert radiologist specializing in chest X-rays.  
+Your task is to generate only the FINDINGS and IMPRESSION sections of a chest X-ray report.  
+
+Follow these rules:
+- Base your report only on the provided FINDINGS.
+- Write in a concise, professional tone used in real radiology reports.
+- Do NOT mention any numeric scores, probabilities, confidence values, or thresholds in the report text.
+- Do NOT include patient identifiers, clinical history, or section headers other than FINDINGS and IMPRESSION.
+- Use complete sentences and standard medical terminology. 
+"""
 
 def retrieve_most_similar(predicted_label_vector, vector_index, reports, k=5):
     query_vector = np.array(predicted_label_vector).astype('float32')
@@ -67,105 +93,82 @@ def retrieve_for_top_symptoms(query_vector, symptom_database_vectors, reports,
     return similar_reports_per_symptom
 
 
+def format_labels(pairs, include_scores):
+    """Format (value, name) pairs with or without scores."""
+    return [
+        f"- {n}: {round(v, 2)}" if include_scores else f"- {n}"
+        for v, n in pairs
+    ]
+
 def build_prompt(label_vector, label_names, retrieved_reports,
-                 threshold=0.55, retrieved=True, binarized=False):
+                 threshold=0.55,
+                 retrieved=True,
+                 include_label_scores=True,
+                 need_sort=True):
     # Convert label vector to readable findings
     label_list = label_vector.tolist()
     # Filter out None names and create valid pairs
-    valid_pairs = [(v, n) for v, n in zip(label_list, label_names) if n]
-    # Get items above threshold
-    if not binarized:
-        above_threshold = [f"- {n}: {round(v, 2)}" for v, n in valid_pairs if v >= threshold]
-    # only add names, not values
-    else:
-        above_threshold = [f"- {n}" for v, n in valid_pairs if v >= threshold]
+    valid_pairs = [(v, n) for v, n in zip(label_list, label_names)]
+    # Sort descending
+    if need_sort:
+        valid_pairs.sort(reverse=True, key=lambda pair: pair[0])
+
+    # Filter above threshold
+    above_threshold = [(v, n) for v, n in valid_pairs if v >= threshold]
 
     if above_threshold:
-        predicted_findings = "\n".join(above_threshold)
-
-    # TODO what if all labels where under threshold? predicted_findings would be empty
-    # I added top 3 symptoms, just not to have empty findings
+        predicted_findings = "\n".join(format_labels(above_threshold, include_label_scores))
     else:
-        # Get top 3 and format
+        # TODO what if all labels where under threshold? predicted_findings would be empty
+        # Fallback to top 3 by score
         top3 = sorted(valid_pairs, key=lambda x: x[0], reverse=True)[:3]
-        if binarized:
-            predicted_findings = "\n".join(f"- {n}: {round(v, 2)}" for v, n in top3)
-        else:
-            predicted_findings = "\n".join(f"- {n}" for _, n in top3)
+        predicted_findings = "\n".join(format_labels(top3, include_label_scores))
 
-    similar_reports = ""
-    # Add retrieved reports
-    for i, report in enumerate(retrieved_reports):
-        similar_reports += f"\n--- Report {i+1} ---\n"
-        similar_reports += f"{report}\n"
+    prompt = f"Findings:\n{predicted_findings}\n"
 
     if retrieved:
-        # Final prompt
-        prompt = f"""You are a radiologist. Based on the following Findings and retrieved report excerpts, generate a radiology report that includes only the FINDINGS and IMPRESSION sections.
+        similar_reports = ""
+        # Add retrieved reports
+        for i, report in enumerate(retrieved_reports):
+            similar_reports += f"\n--- Report {i + 1} ---\n"
+            similar_reports += f"{report}\n"
 
-Write in a concise, professional tone as used in real chest X-ray reports. Do not include patient identifiers, clinical history, or template headers.
+        prompt += f"Retrieved similar reports:\n{similar_reports}"
 
-Findings:
-{predicted_findings}
+    prompt += "\nGenerate a new FINDINGS and IMPRESSION section for this case."
 
-Retrieved similar reports:
-{similar_reports}
-Now write a new FINDINGS and IMPRESSION section for a similar case.
-"""
-    else:
-        prompt = f"""You are a radiologist. Based on the following Findings, generate a radiology report that includes only the FINDINGS and IMPRESSION sections.
-
-Write in a concise, professional tone as used in real chest X-ray reports. Do not include patient identifiers, clinical history, or template headers.
-
-Findings:
-{predicted_findings}
-
-Now write a new FINDINGS and IMPRESSION section for this case.
-"""
     return prompt
 
 
-def call_gpt(client, prompt, model="gpt-4o-mini"):
+def call_gpt(client, prompt, retrieved=True, model="gpt-4o-mini"):
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system",
-             "content": "You are a radiologist assistant generating accurate and concise chest X-ray reports."},
-            {"role": "user",
-             "content": prompt}
+            {
+                "role": "system",
+                "content": RETRIEVAL_SYS_PROMPT if retrieved else NON_RETRIEVAL_SYS_PROMPT
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
         ],
         temperature=0,
         max_tokens=300
     )
     return response.choices[0].message.content
 
-def non_null_finding_impression(row):
-    return row['findings'] and row['impression']
 
 def save_result(input_list, file_path):
-    # todo create directory if doesn't exist
+    # create directory if doesn't exist
+    dir_name = os.path.dirname(file_path)
+    if not os.path.exists(dir_name):
+        os.makedirs(dir_name)
+
     with open(file_path, "w") as f:
         for idx, item in enumerate(input_list):
             data = {idx: item}
             f.write(json.dumps(data) + '\n')
-
-
-def load_and_prepare_samples(max_samples=50, split='validation'):
-    assert split in ['validation', 'test']
-
-    radio_bench_val = load_dataset("ghazal-zamani/mimic_radio")[split]
-    samples, gold_impression, gold_findings = [], [], []
-    # TODO only take samples with both impression and findings? in order to evaluate
-    # couldn't apply filter because of low RAM
-    # radio_bench_val = radio_bench_val.filter(non_null_finding_impression)
-    for s in tqdm(radio_bench_val, desc="Filtering samples"):
-        if s['impression'] and s['findings']:
-            samples.append(s)
-            gold_impression.append(s['impression'])
-            gold_findings.append(s['findings'])
-        if len(samples) == max_samples:
-            break
-    return samples, gold_impression, gold_findings
 
 
 def load_model_and_resources(base_path=''):
@@ -176,7 +179,7 @@ def load_model_and_resources(base_path=''):
     model = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch")
     model = model.to(DEVICE)
 
-    index = faiss.read_index(f"{base_path}/label_vector.index")
+    index = faiss.read_index(f"{base_path}/l1.index")
     with open(f"{base_path}/index_to_report.pkl", "rb") as f:
         original_reports = pickle.load(f)
     db_vectors = np.load(f"{base_path}/symptoms_vectors.npy")
@@ -219,15 +222,16 @@ def predict_retrieve(model, transform, samples, db_vectors, original_reports,
         samples_similar_reports.append(similar_reports)
     return predicted_labels, samples_similar_reports
 
-def run_gpt_reporting_step(predicted_labels,
-                           samples_similar_reports,
-                           model,
-                           gold_impression,
-                           gold_findings,
-                           dir_name,
-                           threshold=0.55,
-                           retrieve_needed=True,
-                           binarized=False):
+def run_gpt_reporting_step(
+        config,
+        predicted_labels,
+        samples_similar_reports,
+        model,
+        gold_impression,
+        gold_findings,
+        threshold=0.65,
+        retrieve_needed=True,
+        include_label_scores=False):
     """
     Calls GPT to generate reports from predicted labels and similar reports.
     Saves the gold and predicted reports to disk.
@@ -242,56 +246,29 @@ def run_gpt_reporting_step(predicted_labels,
     - retrieve_needed: whether to tell the prompt builder that retrieval was used
     """
     client = OpenAI(
-        # api_key=os.environ.get("API_KEY")
+        api_key=config['openai_api_key']
     )
     predicted_reports = []
-
+    prompts = []
+    label_names = [n for n in model.pathologies if n.strip()]
     for labels, similar_reports in tqdm(zip(predicted_labels, samples_similar_reports),
                                         desc="Requesting GPT"):
-        prompt = build_prompt(labels, model.pathologies, similar_reports,
+        prompt = build_prompt(labels, label_names, similar_reports,
                               threshold=threshold,
                               retrieved=retrieve_needed,
-                              binarized=binarized)
-        new_report = call_gpt(client, prompt)
+                              include_label_scores=include_label_scores)
+        prompts.append(prompt)
+        new_report = call_gpt(client, prompt, retrieved=retrieve_needed)
         predicted_reports.append(new_report)
         # break  # for debugging
 
-    save_result(gold_impression, dir_name + "gold_impressions.jsonl")
-    save_result(gold_findings, dir_name + "gold_findings.jsonl")
-    save_result(predicted_reports, dir_name + "predicted_reports.jsonl")
+    save_result(gold_impression, config['output_path'] + "gold_impressions.jsonl")
+    save_result(gold_findings, config['output_path'] + "gold_findings.jsonl")
+    save_result(predicted_reports, config['output_path'] + "predicted_reports.jsonl")
+    save_result(prompts, config['output_path'] + "prompts.jsonl")
 
 
-def all_experiments():
-    all_experiment_modes = ['no_rag', 'rag', 'random_rag']
-    experiment_mode = 'no_rag'
-    assert experiment_mode in all_experiment_modes
-
-    retrieve_needed = True
-    random_documents = False
-
-    if experiment_mode == 'no_rag':
-        retrieve_needed = False
-    if experiment_mode == 'random_rag':
-        random_documents = True
-
-    # dir_name = "exp3/ "
-    dir_name = "test/ "
-    # load samples and ground truth
-    samples, gold_impression, gold_findings = load_and_prepare_samples(max_samples=50)
-    # load model and vector database
-    model, transform, non_empty_indices, index, original_reports, db_vectors = load_model_and_resources(base_path='./embeddings')
-    # predict txr on each sample and retrieve documents
-    predicted_labels, samples_similar_reports = predict_retrieve(model, transform, samples, db_vectors, original_reports,
-                                                                 top_k_symptoms=2,
-                                                                 retrieved_k_reports=3,
-                                                                 randomly=random_documents)
-
-    # TODO pay attention to retrieved boolean!
-    run_gpt_reporting_step(predicted_labels, samples_similar_reports,
-                           model, gold_impression, gold_findings,
-                           dir_name, retrieve_needed)
-
-def study_based_experiment():
+def run_experiment(config, aggregated_scores, study_ground_truth):
     """
     I created a dict mapping study_id -> gold_impression, gold_findings in colab
     for those samples which have both impression and findings
@@ -301,20 +278,28 @@ def study_based_experiment():
     - iterate through first one, find it in the second
     - send request to gpt
     """
+    # initialize wandb
+    os.environ["WANDB_API_KEY"] = config["wandb_api_key"]
+    wandb.init(project=config['wandb_project'],
+               name=config['wandb_run_name'],
+               config=config)
 
-    split = "val"
-    with open(f"./data/aggregated_scores_{split}.pkl", "rb") as f:
-        aggregated_scores = pickle.load(f)
-        # we have 1808 studies (2991 total images)
+    # Use config params
+    top_k_symptoms = config['top_k_symptoms']
+    retrieved_k_reports = config['retrieved_k_reports']
+    binarized_retrieval = config['binarized_retrieval']
+    include_label_scores = config['include_label_scores']
+    retrieval_mode = config['retrieval_mode']
+    threshold = config['threshold']
+    use_retrieval = config['use_retrieval']
+    randomly = config['randomly']
+    index_base_path = config['index_base_path']
 
-    # a dict mapping study_id to ground_truth impression & findings
-    # only for samples having both
-    with open(f"./data/study_to_gold_{split}.pkl", "rb") as f:
-        study_ground_truth = pickle.load(f)
-        # we have 991 studies with both impression and findings
-        # load model and vector database
+
+    # --- Load model + DB ---
     model, transform, non_empty_indices, index, original_reports, db_vectors = load_model_and_resources(
-        base_path='./embeddings')
+        base_path=index_base_path
+    )
 
     gold_impression = []
     gold_findings = []
@@ -323,43 +308,90 @@ def study_based_experiment():
 
     count = 0
     for study_id, gt in study_ground_truth.items():
-        gold_impression.append(gt['impression'])
-        gold_findings.append(gt['findings'])
-        # get the txr vector
+        gold_impression.append(gt["impression"])
+        gold_findings.append(gt["findings"])
+        # get txr vector
         txr_predicted = aggregated_scores[study_id]
-        # retrieve related docs for each
-        dict_symptom_reports = retrieve_for_top_symptoms(txr_predicted,
-                                                         db_vectors,
-                                                         original_reports,
-                                                         top_k_symptoms=2,
-                                                         retrieved_k_reports=3,
-                                                         randomly=False)
-        similar_reports = []
-        for reps in dict_symptom_reports.values():
-            similar_reports.extend(reps)
-        samples_similar_reports.append(similar_reports)
         predicted_labels.append(txr_predicted)
+
+        # --- Apply binarization for retrieval step ---
+        if binarized_retrieval:
+            pass
+            # txr_for_retrieval = (txr_predicted >= threshold).astype(np.float32)
+        else:
+            txr_for_retrieval = txr_predicted
+
+        if use_retrieval:
+            if retrieval_mode == "whole":
+                pass
+            elif retrieval_mode == "partial":
+                dict_symptom_reports = retrieve_for_top_symptoms(
+                    txr_for_retrieval,
+                    db_vectors,
+                    original_reports,
+                    top_k_symptoms=top_k_symptoms,
+                    retrieved_k_reports=retrieved_k_reports,
+                    randomly=randomly
+                )
+            else:
+                raise Exception("retrieval_mode must be 'whole' or 'partial'")
+
+            similar_reports = []
+            for reps in dict_symptom_reports.values():
+                similar_reports.extend(reps)
+            samples_similar_reports.append(similar_reports)
+
+        # create a dummy similar report for run_gpt_reporting_step function
+        else: samples_similar_reports = [[] for _ in range(len(predicted_labels))]
+
         count += 1
-        if count == 50:
-            break
-    # using all train data in index
-    dir_name = 'study_exp6/'
-    retrieve_needed = True
-    binarized = False
-    # TODO pay attention to retrieved boolean!
-    run_gpt_reporting_step(predicted_labels, samples_similar_reports,
-                           model, gold_impression, gold_findings,
-                           dir_name,
-                           threshold=0.7, retrieve_needed=retrieve_needed, binarized=binarized)
+        # if count >= 10:
+        #     break
+
+    # --- GPT reporting step ---
+    run_gpt_reporting_step(
+        config,
+        predicted_labels,
+        samples_similar_reports,
+        model,
+        gold_impression,
+        gold_findings,
+        threshold=threshold,
+        retrieve_needed=use_retrieval,
+        include_label_scores=include_label_scores
+    )
+
 
 # important booleans:
 # retrieve_needed: whether use rag
 # binarized: whether include probabilities
 # randomly: whether use random documents instead of retrieving
-
 def main():
     # all_experiments()
-    study_based_experiment()
+    # study_based_experiment()
+
+    path = "configs/config.yaml"
+    with open(path, 'r') as f:
+        config = yaml.safe_load(f)
+
+    split = "test"
+    # I decided to use mean, it is also possible to use max pool
+    with open(f"./data/mean_scores_{split}.pkl", "rb") as f:
+        # 3269 for test
+        aggregated_scores = pickle.load(f)
+    # a dict mapping study_id to ground_truth impression & findings
+    # only for samples having both
+    with open(f"./data/study_to_gold_{split}.pkl", "rb") as f:
+        # 1624 for test
+        study_ground_truth = pickle.load(f)
+
+    run_experiment(config, aggregated_scores, study_ground_truth)
+    impression_scores, findings_scores = evaluate_reports(config['output_path'])
+
+    wandb.log({
+        "impression": impression_scores,
+        "findings": findings_scores,
+    })
 
 if __name__ == '__main__':
     main()
