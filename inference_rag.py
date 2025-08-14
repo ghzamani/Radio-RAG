@@ -32,6 +32,24 @@ Follow these rules:
 - Use complete sentences and standard medical terminology.  
 """
 
+# only used for (partial and related) mode
+PARTIAL_RELATED_SYS_PROMPT = """You are an expert radiologist specializing in chest X-rays.  
+You will be given the top detected symptoms for the patient.  
+For some symptoms, you will also receive a set of retrieved reports that are most relevant to that specific symptom.  
+These retrieved reports are grouped by symptom so you can clearly see which ones relate to which finding.  
+
+Your task is to generate only the FINDINGS and IMPRESSION sections of a chest X-ray report.  
+
+Follow these rules:
+- Use the provided FINDINGS and retrieved symptom-specific reports as guidance.  
+- Consider the relevance of each retrieved report to its symptom, but integrate the information into a single coherent report.  
+- Write in a concise, professional tone used in real radiology reports.  
+- Do NOT copy text verbatim from retrieved reports unless medically appropriate.  
+- Do NOT mention any numeric scores, probabilities, confidence values, or thresholds in the report text.  
+- Do NOT include patient identifiers, clinical history, or section headers other than FINDINGS and IMPRESSION.  
+- Use complete sentences and standard medical terminology.  
+"""
+
 NON_RETRIEVAL_SYS_PROMPT = """You are an expert radiologist specializing in chest X-rays.  
 Your task is to generate only the FINDINGS and IMPRESSION sections of a chest X-ray report.  
 
@@ -57,10 +75,10 @@ def retrieve_most_similar(predicted_label_vector, vector_index, reports, k=5):
 
 
 # we need a function that considers top-k symptoms, and retrieves k reports for each
-def retrieve_for_top_symptoms(query_vector, symptom_database_vectors, reports,
+def retrieve_for_top_symptoms(query_vector, symptom_database_vectors, reports, label_names,
                               top_k_symptoms=3, retrieved_k_reports=3, randomly=False):
     """
-    query_vector: (1, d) numpy array with float values
+    query_vector: (1, d=11) numpy array with float values
     symptom_database_vectors: (n, d) numpy array used to build the index,
     reports: (n) original reports,
     top_k_symptoms: number of symptoms which are important
@@ -80,7 +98,8 @@ def retrieve_for_top_symptoms(query_vector, symptom_database_vectors, reports,
             distances = np.abs(symptom_database_vectors[:, i] - query_vector[i])
             similar_reports_indices = np.argsort(distances)[:retrieved_k_reports]
             similar_reports = [reports[idx] for idx in similar_reports_indices]
-            similar_reports_per_symptom[f"symptom_{i}"] = similar_reports
+            symptom_name = label_names[i]
+            similar_reports_per_symptom[symptom_name] = similar_reports
 
     else:
         # select reports randomly
@@ -88,7 +107,8 @@ def retrieve_for_top_symptoms(query_vector, symptom_database_vectors, reports,
             # setting seed leads to same reports for all samples
             # random.seed(s)
             similar_reports = random.choices(reports, k=retrieved_k_reports)
-            similar_reports_per_symptom[f"symptom_{i}"] = similar_reports
+            symptom_name = label_names[i]
+            similar_reports_per_symptom[symptom_name] = similar_reports
 
     return similar_reports_per_symptom
 
@@ -100,7 +120,37 @@ def format_labels(pairs, include_scores):
         for v, n in pairs
     ]
 
-def build_prompt(label_vector, label_names, retrieved_reports,
+def format_grouped_reports(dict_symptom_reports, prompt_type='non_related'):
+    """
+    dict_symptom_reports: { symptom_name: [report1, report2, ...], ... }
+    returns formatted multiline string
+    """
+    similar_reports = ""
+    if prompt_type == 'non_related':
+        # Add retrieved reports without any special structure
+        non_structured_reports = []
+        for reports in dict_symptom_reports.values():
+            non_structured_reports.extend(reports)
+        # todo sort these reports in a way cause llm cares about placement
+        for i, report in enumerate(non_structured_reports):
+            similar_reports += f"\n--- Report {i + 1} ---\n"
+            similar_reports += f"{report}\n"
+
+    elif prompt_type == 'related':
+        parts = []
+        for symptom, reports in dict_symptom_reports.items():
+            parts.append(f"===== Symptom: {symptom} =====")
+            for i, rep in enumerate(reports):
+                parts.append(f"--- Report {i + 1} ---\n{rep}\n")
+        similar_reports = "\n".join(parts)
+    else:
+        raise ValueError('prompt_type must be "non_related" or "related"')
+
+    return similar_reports
+
+
+def build_prompt(label_vector, label_names, dict_symptom_reports,
+                 prompt_type='non_related',
                  threshold=0.55,
                  retrieved=True,
                  include_label_scores=True,
@@ -127,30 +177,25 @@ def build_prompt(label_vector, label_names, retrieved_reports,
     prompt = f"Findings:\n{predicted_findings}\n"
 
     if retrieved:
-        similar_reports = ""
-        # Add retrieved reports
-        for i, report in enumerate(retrieved_reports):
-            similar_reports += f"\n--- Report {i + 1} ---\n"
-            similar_reports += f"{report}\n"
-
-        prompt += f"Retrieved similar reports:\n{similar_reports}"
+        similar_reports = format_grouped_reports(dict_symptom_reports, prompt_type)
+        prompt += f"\nRetrieved similar reports:\n{similar_reports}"
 
     prompt += "\nGenerate a new FINDINGS and IMPRESSION section for this case."
 
     return prompt
 
 
-def call_gpt(client, prompt, retrieved=True, model="gpt-4o-mini"):
+def call_gpt(client, user_prompt, system_prompt, model="gpt-4o-mini"):
     response = client.chat.completions.create(
         model=model,
         messages=[
             {
                 "role": "system",
-                "content": RETRIEVAL_SYS_PROMPT if retrieved else NON_RETRIEVAL_SYS_PROMPT
+                "content": system_prompt
             },
             {
                 "role": "user",
-                "content": prompt
+                "content": user_prompt
             }
         ],
         temperature=0,
@@ -160,7 +205,7 @@ def call_gpt(client, prompt, retrieved=True, model="gpt-4o-mini"):
 
 
 def save_result(input_list, file_path):
-    # create directory if doesn't exist
+    # create directory if it doesn't exist
     dir_name = os.path.dirname(file_path)
     if not os.path.exists(dir_name):
         os.makedirs(dir_name)
@@ -213,6 +258,7 @@ def predict_retrieve(model, transform, samples, db_vectors, original_reports,
         dict_symptom_reports = retrieve_for_top_symptoms(pred,
                                                          db_vectors,
                                                          original_reports,
+                                                         # need to add label_names here
                                                          top_k_symptoms=top_k_symptoms,
                                                          retrieved_k_reports=retrieved_k_reports,
                                                          randomly=randomly)
@@ -225,10 +271,8 @@ def predict_retrieve(model, transform, samples, db_vectors, original_reports,
 def run_gpt_reporting_step(
         config,
         predicted_labels,
-        samples_similar_reports,
-        model,
-        gold_impression,
-        gold_findings,
+        samples_symptom_reports,
+        label_names,
         threshold=0.65,
         retrieve_needed=True,
         include_label_scores=False):
@@ -239,33 +283,43 @@ def run_gpt_reporting_step(
     Parameters:
     - predicted_labels: list of label vectors
     - samples_similar_reports: list of retrieved text samples per case
-    - model: the XRV model with .pathologies attribute
-    - gold_impression: list of ground truth impressions
-    - gold_findings: list of ground truth findings
     - dir_name: where to save the outputs (should end with '/')
     - retrieve_needed: whether to tell the prompt builder that retrieval was used
     """
     client = OpenAI(
         api_key=config['openai_api_key']
     )
+
+    prompt_type = config.get('prompt_type', 'non_related')
+    if not config['use_retrieval']:
+        system_prompt = NON_RETRIEVAL_SYS_PROMPT
+    elif prompt_type == 'related':
+        system_prompt = PARTIAL_RELATED_SYS_PROMPT
+    else: system_prompt = RETRIEVAL_SYS_PROMPT
+    print("system prompt:\n", system_prompt)
+
     predicted_reports = []
     prompts = []
-    label_names = [n for n in model.pathologies if n.strip()]
-    for labels, similar_reports in tqdm(zip(predicted_labels, samples_similar_reports),
-                                        desc="Requesting GPT"):
+
+    for idx, (labels, similar_reports) in enumerate(tqdm(zip(predicted_labels, samples_symptom_reports),
+                                                         desc="Requesting GPT")):
         prompt = build_prompt(labels, label_names, similar_reports,
+                              prompt_type=prompt_type,
                               threshold=threshold,
                               retrieved=retrieve_needed,
                               include_label_scores=include_label_scores)
-        prompts.append(prompt)
-        new_report = call_gpt(client, prompt, retrieved=retrieve_needed)
-        predicted_reports.append(new_report)
-        # break  # for debugging
+        new_report = call_gpt(client, prompt, system_prompt)
 
-    save_result(gold_impression, config['output_path'] + "gold_impressions.jsonl")
-    save_result(gold_findings, config['output_path'] + "gold_findings.jsonl")
-    save_result(predicted_reports, config['output_path'] + "predicted_reports.jsonl")
-    save_result(prompts, config['output_path'] + "prompts.jsonl")
+        prompts.append(prompt)
+        predicted_reports.append(new_report)
+
+        # save results right after prediction
+        with open(config['output_path'] + "predicted_reports.jsonl", "a") as pred_f:
+            pred_f.write(json.dumps({idx: new_report}) + "\n")
+
+        with open(config['output_path'] + "prompts.jsonl", "a") as prompt_f:
+            prompt_f.write(json.dumps({idx: prompt}) + "\n")
+        # break  # for debugging
 
 
 def run_experiment(config, aggregated_scores, study_ground_truth):
@@ -278,11 +332,6 @@ def run_experiment(config, aggregated_scores, study_ground_truth):
     - iterate through first one, find it in the second
     - send request to gpt
     """
-    # initialize wandb
-    os.environ["WANDB_API_KEY"] = config["wandb_api_key"]
-    wandb.init(project=config['wandb_project'],
-               name=config['wandb_run_name'],
-               config=config)
 
     # Use config params
     top_k_symptoms = config['top_k_symptoms']
@@ -300,11 +349,19 @@ def run_experiment(config, aggregated_scores, study_ground_truth):
     model, transform, non_empty_indices, index, original_reports, db_vectors = load_model_and_resources(
         base_path=index_base_path
     )
+    label_names = [n for n in model.pathologies if n.strip()]
 
     gold_impression = []
     gold_findings = []
-    samples_similar_reports = []
     predicted_labels = []
+    # each item is a dict for one sample, with symptom as key and retrieved reports as value
+    samples_symptom_reports = []
+    # [
+    #   {
+    #     "Atelectasis": ["Report 1 for Atelectasis", "Report 2 for Atelectasis"],
+    #     "Effusion": ["Report 1 for Effusion", "rep 2"]
+    #   }, ...
+    # ]
 
     count = 0
     for study_id, gt in study_ground_truth.items():
@@ -316,8 +373,8 @@ def run_experiment(config, aggregated_scores, study_ground_truth):
 
         # --- Apply binarization for retrieval step ---
         if binarized_retrieval:
-            pass
-            # txr_for_retrieval = (txr_predicted >= threshold).astype(np.float32)
+            # TODO need to define other similarity metrics and use other index (search for it)
+            txr_for_retrieval = (txr_predicted >= threshold).astype(np.float32)
         else:
             txr_for_retrieval = txr_predicted
 
@@ -329,61 +386,63 @@ def run_experiment(config, aggregated_scores, study_ground_truth):
                     txr_for_retrieval,
                     db_vectors,
                     original_reports,
+                    label_names=label_names,
                     top_k_symptoms=top_k_symptoms,
                     retrieved_k_reports=retrieved_k_reports,
                     randomly=randomly
                 )
+
             else:
                 raise Exception("retrieval_mode must be 'whole' or 'partial'")
 
-            similar_reports = []
-            for reps in dict_symptom_reports.values():
-                similar_reports.extend(reps)
-            samples_similar_reports.append(similar_reports)
+            samples_symptom_reports.append(dict_symptom_reports)
 
         # create a dummy similar report for run_gpt_reporting_step function
-        else: samples_similar_reports = [[] for _ in range(len(predicted_labels))]
+        else:
+            samples_symptom_reports = [{} for _ in range(len(predicted_labels))]
 
         count += 1
-        # if count >= 10:
+        # if count >= 5:
         #     break
+
+    # save ground-truth impression & findings into file
+    save_result(gold_impression, config['output_path'] + "gold_impressions.jsonl")
+    save_result(gold_findings, config['output_path'] + "gold_findings.jsonl")
 
     # --- GPT reporting step ---
     run_gpt_reporting_step(
         config,
         predicted_labels,
-        samples_similar_reports,
-        model,
-        gold_impression,
-        gold_findings,
+        samples_symptom_reports,
+        label_names,
         threshold=threshold,
         retrieve_needed=use_retrieval,
         include_label_scores=include_label_scores
     )
 
 
-# important booleans:
-# retrieve_needed: whether use rag
-# binarized: whether include probabilities
-# randomly: whether use random documents instead of retrieving
 def main():
-    # all_experiments()
-    # study_based_experiment()
-
-    path = "configs/config.yaml"
+    # path = "configs/config.yaml"
+    path = "configs/partial_related.yaml"
     with open(path, 'r') as f:
         config = yaml.safe_load(f)
 
     split = "test"
     # I decided to use mean, it is also possible to use max pool
-    with open(f"./data/mean_scores_{split}.pkl", "rb") as f:
+    with open(f"/root/data/mean_scores_{split}.pkl", "rb") as f:
         # 3269 for test
         aggregated_scores = pickle.load(f)
     # a dict mapping study_id to ground_truth impression & findings
     # only for samples having both
-    with open(f"./data/study_to_gold_{split}.pkl", "rb") as f:
+    with open(f"/root/data/study_to_gold_{split}.pkl", "rb") as f:
         # 1624 for test
         study_ground_truth = pickle.load(f)
+
+    # initialize wandb
+    os.environ["WANDB_API_KEY"] = config["wandb_api_key"]
+    wandb.init(project=config['wandb_project'],
+               name=config['wandb_run_name'],
+               config=config)
 
     run_experiment(config, aggregated_scores, study_ground_truth)
     impression_scores, findings_scores = evaluate_reports(config['output_path'])
