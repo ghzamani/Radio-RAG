@@ -13,23 +13,9 @@ from collections import defaultdict
 import glob
 import re
 
-from utills import xray_transform
+from utills import xray_transform, clean_report
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-def clean_report(report: str) -> str:
-    # Split into findings and impression
-    parts = report.split("IMPRESSION:", 1)
-    if len(parts) == 2:
-        findings, impression = parts
-        # Clean extra spaces/newlines inside each section
-        findings = re.sub(r'\s+', ' ', findings).strip()
-        impression = re.sub(r'\s+', ' ', impression).strip()
-        # Rejoin with a single line break
-        return f"{findings}\nIMPRESSION: {impression}"
-    else:
-        # No IMPRESSION section — just clean the whole thing
-        return re.sub(r'\s+', ' ', report).strip()
 
 def format_report(row, add_delimiters=True):
     # I forgot to clean them before writing to index.
@@ -150,10 +136,11 @@ def predict_txr_study_based(model, transform, df, images_path, label_idx,
                              out_dir)
 
 
-def aggregate_and_save_to_faiss(embed_dir, out_path, index_name):
+def aggregate_and_save_to_faiss(embed_dir, out_path):
     print("Start aggregating results")
     all_study_views = defaultdict(dict)
 
+    # Load chunked embedding dicts
     for embed_file in sorted(glob.glob(f"{embed_dir}/embed_dict_*.pkl")):
         with open(embed_file, "rb") as f:
             chunk = pickle.load(f)
@@ -190,12 +177,27 @@ def aggregate_and_save_to_faiss(embed_dir, out_path, index_name):
             rep = ""
         all_reports.append(rep)
 
-    # all_embeddings = np.array(all_embeddings).astype("float32")
-    all_embeddings = np.vstack(all_embeddings)
-    index = faiss.IndexFlat(all_embeddings.shape[1], faiss.METRIC_L1)
-    index.add(all_embeddings)
-    # write into vector database
-    faiss.write_index(index, f"{out_path}/{index_name}")
+    all_embeddings = np.vstack(all_embeddings).astype("float32")
+    print("saving l1")
+    # L1 index
+    index_l1 = faiss.IndexFlat(all_embeddings.shape[1], faiss.METRIC_L1)
+    index_l1.add(all_embeddings)
+    faiss.write_index(index_l1, f"{out_path}/l1.index")
+
+    print("saving l2")
+    # L2 index
+    index_l2 = faiss.IndexFlatL2(all_embeddings.shape[1])
+    index_l2.add(all_embeddings)
+    faiss.write_index(index_l2, f"{out_path}/l2.index")
+
+    print("saving cosine")
+    # Cosine similarity index (normalize first)
+    norms = np.linalg.norm(all_embeddings, axis=1, keepdims=True)
+    normed_embeddings = all_embeddings / np.maximum(norms, 1e-10)
+    index_cos = faiss.IndexFlatIP(all_embeddings.shape[1])  # inner product == cosine if normalized
+    index_cos.add(normed_embeddings)
+    faiss.write_index(index_cos, f"{out_path}/cosine.index")
+
 
     with open(f"{out_path}/index_to_report.pkl", "wb") as f:
         pickle.dump(all_reports, f)
@@ -204,7 +206,6 @@ def aggregate_and_save_to_faiss(embed_dir, out_path, index_name):
     with open(f"{out_path}/index_to_study_id.pkl", "wb") as f:
         pickle.dump(study_ids, f)
     np.save(f"{out_path}/symptoms_vectors.npy", all_embeddings)
-
 
 
 def main():
@@ -237,9 +238,10 @@ def main():
 
     predict_txr_study_based(model, transform, study_img_report, images_root, valid_indices,
                             chunk_size=500, out_dir="embeddings")
-    aggregate_and_save_to_faiss("embeddings", "embeddings", "l1.index")
+    aggregate_and_save_to_faiss("embeddings", "embeddings")
 
 
 if __name__ == '__main__':
     # main()
-    aggregate_and_save_to_faiss("embeddings", "train_index", "l1.index")
+    aggregate_and_save_to_faiss("/root/data/embeddings",
+                                "/root/data/train_index")
