@@ -61,13 +61,16 @@ Follow these rules:
 - Use complete sentences and standard medical terminology. 
 """
 
-def retrieve_most_similar(predicted_label_vector, vector_index, reports, k=5):
-    query_vector = np.array(predicted_label_vector).astype('float32')
+def retrieve_most_similar(predicted_label_vector, vector_index, reports,
+                          k=5, metric="l2"):
+    query_vector = np.array(predicted_label_vector).astype('float32').reshape(1, -1)
     # only used for cosine similarity
-    # query_vector = query_vector / np.linalg.norm(query_vector)
+    if metric == 'cosine':
+        norm = query_vector / np.linalg.norm(query_vector, axis=1, keepdims=True)
+        query_vector = query_vector / np.maximum(norm, 1e-10)
 
     # Search
-    _, indices = vector_index.search(query_vector.reshape(1, -1), k=k)  # get top 5 similar
+    _, indices = vector_index.search(query_vector, k=k)  # get top 5 similar
 
     # Retrieve reports
     retrieved_reports = [reports[idx] for idx in indices[0]]
@@ -216,7 +219,7 @@ def save_result(input_list, file_path):
             f.write(json.dumps(data) + '\n')
 
 
-def load_model_and_resources(base_path=''):
+def load_model_and_resources(base_path='', index_type='l1'):
     transform = torchvision.transforms.Compose([
         xrv.datasets.XRayCenterCrop(),
         xrv.datasets.XRayResizer(224)
@@ -224,7 +227,13 @@ def load_model_and_resources(base_path=''):
     model = xrv.models.DenseNet(weights="densenet121-res224-mimic_ch")
     model = model.to(DEVICE)
 
-    index = faiss.read_index(f"{base_path}/l1.index")
+    try:
+        index = faiss.read_index(f"{base_path}/{index_type}.index")
+    except FileNotFoundError:
+        print("Index type must be l1, l2, or cosine")
+        # for partial, jaccard & hamming we wouldn't use index
+        index = None
+
     with open(f"{base_path}/index_to_report.pkl", "rb") as f:
         original_reports = pickle.load(f)
     db_vectors = np.load(f"{base_path}/symptoms_vectors.npy")
@@ -291,11 +300,11 @@ def run_gpt_reporting_step(
     )
 
     prompt_type = config.get('prompt_type', 'non_related')
+    system_prompt = RETRIEVAL_SYS_PROMPT
     if not config['use_retrieval']:
         system_prompt = NON_RETRIEVAL_SYS_PROMPT
-    elif prompt_type == 'related':
+    if config['retrieval_mode'] == 'partial' and prompt_type == 'related':
         system_prompt = PARTIAL_RELATED_SYS_PROMPT
-    else: system_prompt = RETRIEVAL_SYS_PROMPT
     print("system prompt:\n", system_prompt)
 
     predicted_reports = []
@@ -333,21 +342,24 @@ def run_experiment(config, aggregated_scores, study_ground_truth):
     - send request to gpt
     """
 
-    # Use config params
-    top_k_symptoms = config['top_k_symptoms']
-    retrieved_k_reports = config['retrieved_k_reports']
-    binarized_retrieval = config['binarized_retrieval']
-    include_label_scores = config['include_label_scores']
     retrieval_mode = config['retrieval_mode']
-    threshold = config['threshold']
     use_retrieval = config['use_retrieval']
     randomly = config['randomly']
     index_base_path = config['index_base_path']
-
+    retrieved_k_reports = config.get('retrieved_k_reports', None)
+    # only for partial
+    top_k_symptoms = config.get('top_k_symptoms', None)
+    # only for whole
+    binarized_retrieval = config.get('binarized_retrieval', None)
+    similarity_metric = config.get('similarity_metric', None)
+    # used for prompt so needed for both modes
+    include_label_scores = config['include_label_scores']
+    threshold = config['threshold']
 
     # --- Load model + DB ---
-    model, transform, non_empty_indices, index, original_reports, db_vectors = load_model_and_resources(
-        base_path=index_base_path
+    # need to load specific vector database
+    model, _, _, index, original_reports, db_vectors = load_model_and_resources(
+        base_path=index_base_path, index_type=similarity_metric
     )
     label_names = [n for n in model.pathologies if n.strip()]
 
@@ -371,19 +383,31 @@ def run_experiment(config, aggregated_scores, study_ground_truth):
         txr_predicted = aggregated_scores[study_id]
         predicted_labels.append(txr_predicted)
 
-        # --- Apply binarization for retrieval step ---
-        if binarized_retrieval:
-            # TODO need to define other similarity metrics and use other index (search for it)
-            txr_for_retrieval = (txr_predicted >= threshold).astype(np.float32)
-        else:
-            txr_for_retrieval = txr_predicted
-
         if use_retrieval:
+            if retrieval_mode not in {"whole", "partial"}:
+                raise ValueError("retrieval_mode must be 'whole' or 'partial'")
+
             if retrieval_mode == "whole":
-                pass
+                if (similarity_metric is None
+                        or binarized_retrieval is None
+                        or retrieved_k_reports is None):
+                    raise Exception("similarity_metric or binarized_retrieval or retrieved_k_reports not defined")
+                # --- Apply binarization for retrieval step ---
+                if binarized_retrieval:
+                    # TODO need to define other similarity metrics and use other index (search for it)
+                    txr_for_retrieval = (txr_predicted >= threshold).astype(np.float32)
+                else:
+                    similar_reports = retrieve_most_similar(txr_predicted, index, original_reports,
+                                                            k=retrieved_k_reports)
+                    # convert to dict format for rest of the code
+                    dict_symptom_reports = {'dummy': similar_reports}
+
             elif retrieval_mode == "partial":
+                if (top_k_symptoms is None
+                        or retrieved_k_reports is None):
+                    raise Exception("top_k_symptoms or retrieved_k_reports not defined")
                 dict_symptom_reports = retrieve_for_top_symptoms(
-                    txr_for_retrieval,
+                    txr_predicted,
                     db_vectors,
                     original_reports,
                     label_names=label_names,
@@ -391,9 +415,6 @@ def run_experiment(config, aggregated_scores, study_ground_truth):
                     retrieved_k_reports=retrieved_k_reports,
                     randomly=randomly
                 )
-
-            else:
-                raise Exception("retrieval_mode must be 'whole' or 'partial'")
 
             samples_symptom_reports.append(dict_symptom_reports)
 
@@ -420,12 +441,28 @@ def run_experiment(config, aggregated_scores, study_ground_truth):
         include_label_scores=include_label_scores
     )
 
-
-def main():
-    # path = "configs/config.yaml"
-    path = "configs/partial_related.yaml"
+def load_config(path):
     with open(path, 'r') as f:
         config = yaml.safe_load(f)
+    return config
+
+def resume_wandb(path, run_id):
+    config = load_config(path)
+    project_name = config['wandb_project']
+    os.environ["WANDB_API_KEY"] = config["wandb_api_key"]
+    wandb.init(project=project_name, id=run_id, resume="must")
+
+    impression_scores, findings_scores = evaluate_reports(config['output_path'])
+    wandb.log({
+        "impression": impression_scores,
+        "findings": findings_scores,
+    })
+    wandb.finish()
+
+
+def main():
+    path = "configs/whole_cos_include_score.yaml"
+    config = load_config(path)
 
     split = "test"
     # I decided to use mean, it is also possible to use max pool
@@ -454,3 +491,5 @@ def main():
 
 if __name__ == '__main__':
     main()
+    # resume_wandb("configs/partial_include_score_related.yaml", run_id="50vo48ia")
+    # resume_wandb("configs/partial_no_score_simple.yaml", run_id="3q3ghoh4")
