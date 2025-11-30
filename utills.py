@@ -98,6 +98,21 @@ def extract_sections(report_text):
     return findings, impression
 
 
+def clean_report(report: str) -> str:
+    # Split into findings and impression
+    parts = report.split("IMPRESSION:", 1)
+    if len(parts) == 2:
+        findings, impression = parts
+        # Clean extra spaces/newlines inside each section
+        findings = re.sub(r'\s+', ' ', findings).strip()
+        impression = re.sub(r'\s+', ' ', impression).strip()
+        # Rejoin with a single line break
+        return f"{findings}\nIMPRESSION: {impression}"
+    else:
+        # No IMPRESSION section — just clean the whole thing
+        return re.sub(r'\s+', ' ', report).strip()
+
+
 def save_list_to_txt(my_list, file_path):
     with open(file_path, "w") as f:
         for item in my_list:

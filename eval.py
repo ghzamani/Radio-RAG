@@ -33,6 +33,28 @@ def evaluate_reports(dir_name: str):
 
     return impression_scores, findings_scores
 
+def convert_chexbert(dir_name):
+    gold_impressions = list(read_jsonl_as_dict(dir_name + 'gold_impressions.jsonl').values())
+    gold_findings = list(read_jsonl_as_dict(dir_name + 'gold_findings.jsonl').values())
+    predicted_impressions = list(read_jsonl_as_dict(dir_name + 'pred_impression.jsonl').values())
+    predicted_findings = list(read_jsonl_as_dict(dir_name + 'pred_findings.jsonl').values())
+
+    # convert ground truth & predictions to lower
+    gold_impressions = lower_case(gold_impressions)
+    gold_findings = lower_case(gold_findings)
+    predicted_impressions = lower_case(predicted_impressions)
+    predicted_findings = lower_case(predicted_findings)
+
+    print("Computing impression scores")
+    impression_scores = compute_scores(gold_impressions, predicted_impressions,
+                                       output_name=dir_name + "impression_scores.json")
+    print("Computing findings scores")
+    findings_scores = compute_scores(gold_findings, predicted_findings,
+                                     output_name=dir_name + "findings_scores.json")
+    print("impression:", impression_scores)
+    print("findings:", findings_scores)
+
 
 if __name__ == '__main__':
-    evaluate_reports("study_exp6/")
+    # evaluate_reports("study_exp6/")
+    convert_chexbert('./results/chexpert/')

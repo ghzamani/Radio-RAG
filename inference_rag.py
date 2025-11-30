@@ -13,6 +13,7 @@ import json
 import random
 import yaml
 import wandb
+from collections import Counter
 
 # from utills import load_test_bench, xray_transform, load_radio_bench, extract_sections
 from utills import xray_transform
@@ -25,6 +26,22 @@ Your task is to generate only the FINDINGS and IMPRESSION sections of a chest X-
 
 Follow these rules:
 - Base your report on the provided FINDINGS and retrieved similar reports for guidance.  
+- Write in a concise, professional tone used in real radiology reports.
+- Do NOT copy text verbatim from retrieved reports unless medically appropriate.  
+- Do NOT mention any numeric scores, probabilities, confidence values, or thresholds in the report text.
+- Do NOT include patient identifiers, clinical history, or section headers other than FINDINGS and IMPRESSION.  
+- Use complete sentences and standard medical terminology.  
+"""
+
+RETRIEVAL_WITH_NEGATIVE_SYS_PROMPT = """You are an expert radiologist specializing in chest X-rays.  
+Your task is to generate only the FINDINGS and IMPRESSION sections of a chest X-ray report.  
+
+Follow these rules:
+- Base your report on the **provided FINDINGS** and **retrieved similar reports** for guidance.  
+- Retrieved **dissimilar** reports are provided as **explicit negative examples**. These describe cases that are different from the current patient.  
+    -- DO NOT copy, paraphrase, or include content from dissimilar reports unless it is also supported by the predicted findings or similar reports.  
+    -- Treat them only as guidance for what to AVOID in this case.  
+- Always prefer evidence from predicted labels and similar reports over anything else.  
 - Write in a concise, professional tone used in real radiology reports.
 - Do NOT copy text verbatim from retrieved reports unless medically appropriate.  
 - Do NOT mention any numeric scores, probabilities, confidence values, or thresholds in the report text.
@@ -61,6 +78,53 @@ Follow these rules:
 - Use complete sentences and standard medical terminology. 
 """
 
+
+def jaccard_batch(query, matrix):
+    """
+    Compute Jaccard similarity between a binary query and a binary matrix.
+    query: shape (d,), binary 0/1
+    matrix: shape (n, d), binary 0/1
+    returns: shape (n,)
+    """
+    intersection = np.sum(np.logical_and(matrix, query), axis=1)
+    union = np.sum(np.logical_or(matrix, query), axis=1)
+    # avoid division by zero
+    return intersection / (union + 1e-10)
+
+def hamming_similarity(query, matrix):
+    # similarity = 1 - normalized distance
+    distance = np.sum(matrix != query, axis=1) / matrix.shape[1]
+    return 1 - distance
+
+def cosine_similarity(query, matrix):
+    """
+    Compute cosine similarity between query and matrix.
+    query: shape (d,)
+    matrix: shape (n, d)
+    returns: shape (n,)
+    """
+    dot = matrix @ query
+    query_norm = np.linalg.norm(query)
+    matrix_norms = np.linalg.norm(matrix, axis=1)
+    return dot / (matrix_norms * query_norm + 1e-10)
+
+def retrieve_with_backup(query_bin, query_float, db_bin, db_float, reports,
+                         k=5, primary="jaccard"):
+    # pick primary similarity
+    if primary == "jaccard":
+        sims = jaccard_batch(query_bin, db_bin)
+    elif primary == "hamming":
+        sims = hamming_similarity(query_bin, db_bin)
+    else:
+        raise ValueError("primary metric must be 'jaccard' or 'hamming'")
+
+    cosine_sims = cosine_similarity(query_float, db_float)
+    # argsort by Jaccard/Hamming first (descending), then cosine (descending)
+    indices = np.lexsort((-cosine_sims, -sims))
+    topk = indices[:k]
+    return [reports[i] for i in topk]
+
+
 def retrieve_most_similar(predicted_label_vector, vector_index, reports,
                           k=5, metric="l2"):
     query_vector = np.array(predicted_label_vector).astype('float32').reshape(1, -1)
@@ -77,10 +141,10 @@ def retrieve_most_similar(predicted_label_vector, vector_index, reports,
     return retrieved_reports
 
 
-# we need a function that considers top-k symptoms, and retrieves k reports for each
 def retrieve_for_top_symptoms(query_vector, symptom_database_vectors, reports, label_names,
                               top_k_symptoms=3, retrieved_k_reports=3, randomly=False):
     """
+    Considers top-k symptoms, and retrieves k reports for each
     query_vector: (1, d=11) numpy array with float values
     symptom_database_vectors: (n, d) numpy array used to build the index,
     reports: (n) original reports,
@@ -157,7 +221,8 @@ def build_prompt(label_vector, label_names, dict_symptom_reports,
                  threshold=0.55,
                  retrieved=True,
                  include_label_scores=True,
-                 need_sort=True):
+                 need_sort=True,
+                 negative_dict_symptom_reports=None):
     # Convert label vector to readable findings
     label_list = label_vector.tolist()
     # Filter out None names and create valid pairs
@@ -182,6 +247,10 @@ def build_prompt(label_vector, label_names, dict_symptom_reports,
     if retrieved:
         similar_reports = format_grouped_reports(dict_symptom_reports, prompt_type)
         prompt += f"\nRetrieved similar reports:\n{similar_reports}"
+
+    if negative_dict_symptom_reports:
+        dissimilar_reports = format_grouped_reports(negative_dict_symptom_reports, prompt_type)
+        prompt += f"\nRetrieved dissimilar reports: (negative references)\n{dissimilar_reports}"
 
     prompt += "\nGenerate a new FINDINGS and IMPRESSION section for this case."
 
@@ -229,7 +298,8 @@ def load_model_and_resources(base_path='', index_type='l1'):
 
     try:
         index = faiss.read_index(f"{base_path}/{index_type}.index")
-    except FileNotFoundError:
+        print(f"index {index_type} loaded.")
+    except:
         print("Index type must be l1, l2, or cosine")
         # for partial, jaccard & hamming we wouldn't use index
         index = None
@@ -330,6 +400,66 @@ def run_gpt_reporting_step(
             prompt_f.write(json.dumps({idx: prompt}) + "\n")
         # break  # for debugging
 
+def run_gpt_reporting_step_negative(
+        config,
+        predicted_labels,
+        samples_symptom_reports,
+        negative_samples_symptom_reports,
+        label_names,
+        threshold=0.65,
+        retrieve_needed=True,
+        include_label_scores=False):
+
+    client = OpenAI(
+        api_key=config['openai_api_key']
+    )
+
+    prompt_type = config.get('prompt_type', 'non_related')
+    # system_prompt = RETRIEVAL_SYS_PROMPT
+    # if not config['use_retrieval']:
+    #     system_prompt = NON_RETRIEVAL_SYS_PROMPT
+    # if config['retrieval_mode'] == 'partial' and prompt_type == 'related':
+    #     system_prompt = PARTIAL_RELATED_SYS_PROMPT
+    system_prompt = RETRIEVAL_WITH_NEGATIVE_SYS_PROMPT
+    print("system prompt:\n", system_prompt)
+
+    predicted_reports = []
+    prompts = []
+
+    for idx, (labels, similar_reports, dissimilar_reports) in enumerate(tqdm(zip(predicted_labels,
+                                                                                 samples_symptom_reports,
+                                                                                 negative_samples_symptom_reports),
+                                                                             desc="Requesting GPT")):
+        prompt = build_prompt(labels, label_names, similar_reports,
+                              prompt_type=prompt_type,
+                              threshold=threshold,
+                              retrieved=retrieve_needed,
+                              include_label_scores=include_label_scores,
+                              negative_dict_symptom_reports=dissimilar_reports)
+        new_report = call_gpt(client, prompt, system_prompt)
+
+        prompts.append(prompt)
+        predicted_reports.append(new_report)
+
+        # save results right after prediction
+        with open(config['output_path'] + "predicted_reports.jsonl", "a") as pred_f:
+            pred_f.write(json.dumps({idx: new_report}) + "\n")
+
+        with open(config['output_path'] + "prompts.jsonl", "a") as prompt_f:
+            prompt_f.write(json.dumps({idx: prompt}) + "\n")
+        # break  # for debugging
+
+
+def count_non_zero(predictions, threshold=0.65):
+    """count number of 1s of each study after converting to binarized version, just for analysis"""
+    predictions_np = np.array(predictions)
+    binary_predictions_np = (predictions_np >= threshold).astype(int)
+    counts_per_row = np.count_nonzero(binary_predictions_np == 1, axis=1)
+    count_distribution = Counter(counts_per_row)
+    print("1_count, total")
+    for key, c in count_distribution.items():
+        print(key, c)
+    return count_distribution
 
 def run_experiment(config, aggregated_scores, study_ground_truth):
     """
@@ -352,6 +482,7 @@ def run_experiment(config, aggregated_scores, study_ground_truth):
     # only for whole
     binarized_retrieval = config.get('binarized_retrieval', None)
     similarity_metric = config.get('similarity_metric', None)
+    negative_retrieval = config.get('negative_retrieval', False)
     # used for prompt so needed for both modes
     include_label_scores = config['include_label_scores']
     threshold = config['threshold']
@@ -368,6 +499,7 @@ def run_experiment(config, aggregated_scores, study_ground_truth):
     predicted_labels = []
     # each item is a dict for one sample, with symptom as key and retrieved reports as value
     samples_symptom_reports = []
+    samples_symptom_reports_negative = []
     # [
     #   {
     #     "Atelectasis": ["Report 1 for Atelectasis", "Report 2 for Atelectasis"],
@@ -376,7 +508,7 @@ def run_experiment(config, aggregated_scores, study_ground_truth):
     # ]
 
     count = 0
-    for study_id, gt in study_ground_truth.items():
+    for study_id, gt in tqdm(study_ground_truth.items(), desc="Iterating through studies"):
         gold_impression.append(gt["impression"])
         gold_findings.append(gt["findings"])
         # get txr vector
@@ -387,6 +519,7 @@ def run_experiment(config, aggregated_scores, study_ground_truth):
             if retrieval_mode not in {"whole", "partial"}:
                 raise ValueError("retrieval_mode must be 'whole' or 'partial'")
 
+            dict_symptom_reports = {}
             if retrieval_mode == "whole":
                 if (similarity_metric is None
                         or binarized_retrieval is None
@@ -394,13 +527,29 @@ def run_experiment(config, aggregated_scores, study_ground_truth):
                     raise Exception("similarity_metric or binarized_retrieval or retrieved_k_reports not defined")
                 # --- Apply binarization for retrieval step ---
                 if binarized_retrieval:
-                    # TODO need to define other similarity metrics and use other index (search for it)
-                    txr_for_retrieval = (txr_predicted >= threshold).astype(np.float32)
+                    txr_for_retrieval = (txr_predicted >= threshold).astype(int)
+
+                    # binarize train vectors
+                    db_vectors_binarized = (db_vectors >= threshold).astype(int)
+                    similar_reports = retrieve_with_backup(txr_for_retrieval, txr_predicted,
+                                                           db_vectors_binarized, db_vectors,
+                                                           original_reports,
+                                                           primary=similarity_metric, k=retrieved_k_reports)
+                    # negative context
+                    if negative_retrieval:
+                        negative_txr = 1 - txr_for_retrieval
+                        dissimilar_reports = retrieve_with_backup(negative_txr, txr_predicted,
+                                                                  db_vectors_binarized, db_vectors,
+                                                                  original_reports,
+                                                                  primary=similarity_metric, k=retrieved_k_reports)
+                        dict_symptom_reports_negative = {'dummy': dissimilar_reports}
+                        samples_symptom_reports_negative.append(dict_symptom_reports_negative)
+
                 else:
                     similar_reports = retrieve_most_similar(txr_predicted, index, original_reports,
                                                             k=retrieved_k_reports)
-                    # convert to dict format for rest of the code
-                    dict_symptom_reports = {'dummy': similar_reports}
+                # convert to dict format for rest of the code
+                dict_symptom_reports = {'dummy': similar_reports}
 
             elif retrieval_mode == "partial":
                 if (top_k_symptoms is None
@@ -415,7 +564,9 @@ def run_experiment(config, aggregated_scores, study_ground_truth):
                     retrieved_k_reports=retrieved_k_reports,
                     randomly=randomly
                 )
-
+            # is there any possibility that dict_symptom_reports remains empty?
+            if not dict_symptom_reports:
+                raise Exception("dict_symptom_reports not defined")
             samples_symptom_reports.append(dict_symptom_reports)
 
         # create a dummy similar report for run_gpt_reporting_step function
@@ -425,21 +576,35 @@ def run_experiment(config, aggregated_scores, study_ground_truth):
         count += 1
         # if count >= 5:
         #     break
+    if retrieval_mode == "whole" and binarized_retrieval:
+        count_non_zero(predicted_labels, threshold)
 
     # save ground-truth impression & findings into file
     save_result(gold_impression, config['output_path'] + "gold_impressions.jsonl")
     save_result(gold_findings, config['output_path'] + "gold_findings.jsonl")
 
-    # --- GPT reporting step ---
-    run_gpt_reporting_step(
-        config,
-        predicted_labels,
-        samples_symptom_reports,
-        label_names,
-        threshold=threshold,
-        retrieve_needed=use_retrieval,
-        include_label_scores=include_label_scores
-    )
+    if negative_retrieval:
+        run_gpt_reporting_step_negative(
+            config,
+            predicted_labels,
+            samples_symptom_reports,
+            samples_symptom_reports_negative,
+            label_names,
+            threshold=threshold,
+            retrieve_needed=use_retrieval,
+            include_label_scores=include_label_scores
+        )
+    else:
+        # --- GPT reporting step ---
+        run_gpt_reporting_step(
+            config,
+            predicted_labels,
+            samples_symptom_reports,
+            label_names,
+            threshold=threshold,
+            retrieve_needed=use_retrieval,
+            include_label_scores=include_label_scores
+        )
 
 def load_config(path):
     with open(path, 'r') as f:
@@ -447,6 +612,7 @@ def load_config(path):
     return config
 
 def resume_wandb(path, run_id):
+    # be careful about the run id!
     config = load_config(path)
     project_name = config['wandb_project']
     os.environ["WANDB_API_KEY"] = config["wandb_api_key"]
@@ -460,9 +626,12 @@ def resume_wandb(path, run_id):
     wandb.finish()
 
 
-def main():
-    path = "configs/whole_cos_include_score.yaml"
-    config = load_config(path)
+# def main():
+def exp_with_eval(conf_path):
+    # path = "configs/whole_l2_no_score.yaml"
+    # path = "configs/whole_negative_jaccard_include_score.yaml"
+    # config = load_config(path)
+    config = load_config(conf_path)
 
     split = "test"
     # I decided to use mean, it is also possible to use max pool
@@ -475,6 +644,7 @@ def main():
         # 1624 for test
         study_ground_truth = pickle.load(f)
 
+    # swin_chexpert(study_ground_truth)
     # initialize wandb
     os.environ["WANDB_API_KEY"] = config["wandb_api_key"]
     wandb.init(project=config['wandb_project'],
@@ -488,8 +658,45 @@ def main():
         "impression": impression_scores,
         "findings": findings_scores,
     })
+    wandb.finish()
+
+
+def swin_chexpert(study_ground_truth):
+    with open('/root/codes/radio/data/study_impression_swin_test.pkl', 'rb') as f:
+        scores = pickle.load(f)
+    aggregated_scores = {}
+    for std_id, views in scores.items():
+        preds = list(views.values())
+        rnd = random.choice(preds)
+        aggregated_scores[std_id] = rnd
+
+    gold_impression = []
+    gold_findings = []
+    preds = []
+    for study_id, gt in tqdm(study_ground_truth.items(), desc="Iterating through studies"):
+        gold_impression.append(gt["impression"])
+        # gold_findings.append(gt["findings"])
+
+        pred = aggregated_scores[study_id]
+        preds.append(pred)
+
+    base = "./results/chexpert/"
+    save_result(gold_impression, base + "gold_impressions.jsonl")
+    save_result(preds, base + "pred_impression.jsonl")
+
 
 if __name__ == '__main__':
-    main()
+    exp_with_eval('configs/whole_l2_include_score_less_context.yaml')
+    exp_with_eval('configs/whole_l2_include_score_more_context.yaml')
+    # for i in range(2, 6):
+    #     conf_path = f"configs/baseline_{i}.yaml"
+    #     print(conf_path)
+    #     exp_with_eval(conf_path)
+
+    # main()
     # resume_wandb("configs/partial_include_score_related.yaml", run_id="50vo48ia")
     # resume_wandb("configs/partial_no_score_simple.yaml", run_id="3q3ghoh4")
+    # resume_wandb("configs/whole_l2_include_score.yaml", run_id="2l94ju4p")
+    # resume_wandb("configs/whole_cos_include_score.yaml", run_id="zw5dp6tn")
+    # resume_wandb("configs/whole_hamming_include_score.yaml", run_id="630zmdut")
+    # resume_wandb("configs/whole_hamming_no_score.yaml", run_id="dw14or65")
